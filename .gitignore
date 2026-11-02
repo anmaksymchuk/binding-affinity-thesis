@@ -1,0 +1,27 @@
+# --- Данные (PDBbind и индексы не публикуем: лицензия + размер) ---
+refined_set/
+*.pdb
+*.sdf
+*.mol2
+INDEX_*
+CoreSet.dat
+
+# --- Сгенерированное ---
+processed/
+outputs/
+esm_embeddings.pt
+*.pt
+*.pth
+*.ckpt
+
+# --- Python / окружение ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Системное ---
+.DS_Store
+.idea/
+.vscode/

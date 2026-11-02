@@ -1,0 +1,9 @@
+torch
+torch-geometric
+pennylane
+rdkit
+fair-esm
+numpy
+pandas
+scipy
+tqdm
