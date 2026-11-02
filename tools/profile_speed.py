@@ -18,7 +18,7 @@ dev = c.device
 ds = Ligand_Protein_Dataset(
     root=c.root, data_dir=c.data_dir, complexes_csv=c.complexes_csv,
     dataset_tag=c.dataset_tag, esm_path=c.esm_path, esm_dim=c.esm_dim,
-    shard_size=c.graph_shard_size,
+    shard_size=c.graph_shard_size, pocket_hydrogens=c.pocket_hydrogens,
 )
 
 g = torch.Generator().manual_seed(0)

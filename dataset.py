@@ -35,6 +35,29 @@ class ComplexData(Data):
         return super().__inc__(key, value, *args, **kwargs)
 
 
+def remove_nonpolar_hydrogens(mol):
+    """
+    Remove hydrogens bonded to carbon; their count moves to the carbon.
+    """
+    rw = Chem.RWMol(mol)
+    to_remove = []
+
+    for atom in rw.GetAtoms():
+        if atom.GetAtomicNum() != 1 or atom.GetDegree() != 1:
+            continue
+        heavy = atom.GetNeighbors()[0]
+        if heavy.GetAtomicNum() == 6:
+            heavy.SetNumExplicitHs(heavy.GetNumExplicitHs() + 1)
+            to_remove.append(atom.GetIdx())
+
+    for idx in sorted(to_remove, reverse=True):
+        rw.RemoveAtom(idx)
+
+    out = rw.GetMol()
+    out.UpdatePropertyCache(strict=False)
+    return out
+
+
 class _GraphShard(InMemoryDataset):
     """
     One collated shard of graphs, loaded from disk (never processed here).
@@ -74,6 +97,7 @@ class Ligand_Protein_Dataset(Dataset):
         esm_path=None,
         esm_dim=320,
         shard_size=1000,
+        pocket_hydrogens="all",
         transform=None,
         pre_transform=None,
     ):
@@ -82,6 +106,10 @@ class Ligand_Protein_Dataset(Dataset):
         self.dataset_tag = dataset_tag
         self.esm_dim = esm_dim
         self.shard_size = shard_size
+
+        if pocket_hydrogens not in ("all", "polar", "none"):
+            raise ValueError("pocket_hydrogens must be 'all', 'polar' or 'none'")
+        self.pocket_hydrogens = pocket_hydrogens
 
         self._rows = self._rows_to_process()
         self.n_shards = max(1, math.ceil(len(self._rows) / shard_size))
@@ -201,6 +229,13 @@ class Ligand_Protein_Dataset(Dataset):
     def _load_pocket(self, pocket_path):
         """
         Load protein pocket from PDB file.
+
+        pocket_hydrogens:
+            "all"   - keep every hydrogen in the file as a node
+            "polar" - drop hydrogens bonded to carbon
+            "none"  - heavy atoms only
+        Removed hydrogens are kept as H counts on their heavy atom,
+        so GetTotalNumHs() stays correct.
         """
         if not os.path.exists(pocket_path):
             return None
@@ -211,7 +246,17 @@ class Ligand_Protein_Dataset(Dataset):
             removeHs=False,
         )
 
-        return pocket
+        if pocket is None or self.pocket_hydrogens == "all":
+            return pocket
+
+        if self.pocket_hydrogens == "none":
+            params = Chem.RemoveHsParameters()
+            params.removeDegreeZero = True
+            pocket = Chem.RemoveHs(pocket, params, sanitize=False)
+            pocket.UpdatePropertyCache(strict=False)
+            return pocket
+
+        return remove_nonpolar_hydrogens(pocket)
 
     def _build_graph(self, row):
         """

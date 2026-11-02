@@ -38,7 +38,13 @@ class Config:
 
     # Name of the cached graph file in processed/. Change it (or delete the
     # file) whenever graph building or the label source changes.
-    dataset_tag = f"v2020R1_cleansplit_{label_source}"
+    # Hydrogens of the pocket kept as graph nodes:
+    #   "all"   - every H in the file (R1 pockets: ~48% of atoms are H)
+    #   "polar" - only H on N/O/S (like the 2016 pocket files)
+    #   "none"  - heavy atoms only; H counts stay as an atom feature
+    pocket_hydrogens = "none"
+
+    dataset_tag = f"v2020R1_cleansplit_{label_source}_pocketH-{pocket_hydrogens}"
 
     # Graphs are built and saved in shards of this many complexes
     # (saving all ~17k at once ran out of RAM on Colab).
