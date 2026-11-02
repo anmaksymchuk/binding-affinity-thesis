@@ -1,10 +1,12 @@
 import os
 import json
+import math
+import bisect
 import torch
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import MolFromPDBFile, MolFromMol2File
-from torch_geometric.data import InMemoryDataset, Data
+from torch_geometric.data import Dataset, InMemoryDataset, Data
 
 from cleansplit import load_complexes_table
 from utils import (
@@ -33,7 +35,21 @@ class ComplexData(Data):
         return super().__inc__(key, value, *args, **kwargs)
 
 
-class Ligand_Protein_Dataset(InMemoryDataset):
+class _GraphShard(InMemoryDataset):
+    """
+    One collated shard of graphs, loaded from disk (never processed here).
+    """
+
+    def __init__(self, path):
+        super().__init__(root=None)
+
+        if hasattr(InMemoryDataset, "load"):
+            self.load(path)
+        else:
+            self.data, self.slices = torch.load(path, weights_only=False)
+
+
+class Ligand_Protein_Dataset(Dataset):
     """
     Graphs for all complexes listed in complexes.csv (built by cleansplit.py)
     that have structure files and a label.
@@ -41,8 +57,12 @@ class Ligand_Protein_Dataset(InMemoryDataset):
     Label filters (censored / approximate) are NOT applied here, so changing
     them in config does not require rebuilding the graphs; main.py selects IDs.
 
-    Next to the graph file, processed/<tag>_index.json records which IDs were
-    processed and why the others were skipped.
+    Graphs are built and saved in shards of `shard_size` complexes:
+        processed/graphs_<tag>_shardNNN.pt    collated graphs
+        processed/graphs_<tag>_shardNNN.json  IDs of the shard and why some were skipped
+    Collating all ~17k graphs at once needs about twice the dataset size in RAM
+    and crashed Colab; shards keep the peak small. If processing is
+    interrupted, finished shards are reused on the next run.
     """
 
     def __init__(
@@ -53,6 +73,7 @@ class Ligand_Protein_Dataset(InMemoryDataset):
         dataset_tag,
         esm_path=None,
         esm_dim=320,
+        shard_size=1000,
         transform=None,
         pre_transform=None,
     ):
@@ -60,6 +81,10 @@ class Ligand_Protein_Dataset(InMemoryDataset):
         self.complexes_csv = complexes_csv
         self.dataset_tag = dataset_tag
         self.esm_dim = esm_dim
+        self.shard_size = shard_size
+
+        self._rows = self._rows_to_process()
+        self.n_shards = max(1, math.ceil(len(self._rows) / shard_size))
 
         # ---------------------------
         # Load ESM embeddings
@@ -78,58 +103,69 @@ class Ligand_Protein_Dataset(InMemoryDataset):
 
         super().__init__(root, transform, pre_transform)
 
-        self._load_graphs(self.processed_paths[0])
+        self._load_shards()
 
-        with open(self.processed_paths[1]) as f:
-            index = json.load(f)
+    # ---------------------------
+    # Files
+    # ---------------------------
+    def _shard_base(self, k):
+        return f"graphs_{self.dataset_tag}_shard{k:03d}"
 
-        self.processed_ids = index["processed"]
-        self.skipped = index["skipped"]
+    def _shard_paths(self, k):
+        base = os.path.join(self.processed_dir, self._shard_base(k))
+        return base + ".pt", base + ".json"
 
-        self._check_cache_matches_table()
+    def _shard_rows(self, k):
+        return self._rows.iloc[k * self.shard_size:(k + 1) * self.shard_size]
 
     @property
     def processed_file_names(self):
-        return [
-            f"graphs_{self.dataset_tag}.pt",
-            f"graphs_{self.dataset_tag}_index.json",
-        ]
-
-    # ---------------------------
-    # Save / load (PyG >= 2.4 has InMemoryDataset.save/load)
-    # ---------------------------
-    def _save_graphs(self, data_list, path):
-        if hasattr(InMemoryDataset, "save"):
-            self.save(data_list, path)
-        else:
-            torch.save(self.collate(data_list), path)
-
-    def _load_graphs(self, path):
-        if hasattr(InMemoryDataset, "load"):
-            self.load(path)
-        else:
-            self.data, self.slices = torch.load(path, weights_only=False)
+        names = []
+        for k in range(self.n_shards):
+            names += [self._shard_base(k) + ".pt", self._shard_base(k) + ".json"]
+        return names
 
     def _rows_to_process(self):
         table = load_complexes_table(self.complexes_csv)
-        return table[table["has_structure"] & table["pk"].notna()]
+        rows = table[table["has_structure"] & table["pk"].notna()]
+        return rows.sort_values("pdb_id").reset_index(drop=True)
 
-    def _check_cache_matches_table(self):
+    def _load_shards(self):
         """
-        The graph file is cached by name only; make sure it still covers the
-        current complexes.csv.
+        Load all shards and check that they match the current complexes.csv
+        (the cache is keyed by file name only).
         """
-        wanted = set(self._rows_to_process()["pdb_id"])
-        known = set(self.processed_ids) | set(self.skipped)
-        not_in_cache = wanted - known
+        self._shards = []
+        self._offsets = [0]
+        self.processed_ids = []
+        self.skipped = {}
 
-        if not_in_cache:
-            raise RuntimeError(
-                f"{len(not_in_cache)} complexes from {self.complexes_csv} are not in "
-                f"the cached graphs {self.processed_paths[0]} "
-                f"(e.g. {sorted(not_in_cache)[:5]}). Delete the two files "
-                f"{self.processed_file_names} in {self.processed_dir} to rebuild."
-            )
+        for k in range(self.n_shards):
+            pt_path, json_path = self._shard_paths(k)
+
+            with open(json_path) as f:
+                info = json.load(f)
+
+            expected = list(self._shard_rows(k)["pdb_id"])
+            if info["ids"] != expected:
+                raise RuntimeError(
+                    f"Cached shard {json_path} does not match {self.complexes_csv} "
+                    f"(the table changed after the graphs were built). Delete "
+                    f"{self.processed_dir}/graphs_{self.dataset_tag}_shard* to rebuild."
+                )
+
+            self.processed_ids += info["processed"]
+            self.skipped.update(info["skipped"])
+
+            if info["processed"]:
+                shard = _GraphShard(pt_path)
+                if len(shard) != len(info["processed"]):
+                    raise RuntimeError(f"{pt_path} is incomplete. Delete it to rebuild.")
+                self._shards.append(shard)
+                self._offsets.append(self._offsets[-1] + len(shard))
+
+    def len(self):
+        return self._offsets[-1]
 
     def _load_ligand(self, ligand_path):
         """
@@ -177,106 +213,155 @@ class Ligand_Protein_Dataset(InMemoryDataset):
 
         return pocket
 
+    def _build_graph(self, row):
+        """
+        Returns (ComplexData, "") or (None, reason).
+        """
+        pdb_id = row.pdb_id
+        binding_affinity = float(row.pk)
+
+        # ---------------------------
+        # Load ligand and pocket
+        # ---------------------------
+        ligand = self._load_ligand(os.path.join(self.data_dir, row.ligand_file))
+
+        if ligand is None:
+            return None, "ligand_parse_failed"
+
+        pocket = self._load_pocket(os.path.join(self.data_dir, row.pocket_file))
+
+        if pocket is None:
+            return None, "pocket_parse_failed"
+
+        # ---------------------------
+        # Build graphs
+        # ---------------------------
+        ligand_graph = ligand_to_graph(ligand)
+        protein_graph = protein_to_graph(pocket)
+
+        if ligand_graph is None or protein_graph is None:
+            return None, "no_coordinates"
+
+        graph_data = covalent_and_intermolecular_interactions_graph(
+            ligand_graph,
+            protein_graph,
+        )
+
+        if graph_data is None:
+            return None, "bad_graph"
+
+        # ---------------------------
+        # Split graph into two branches
+        # ---------------------------
+        num_covalent = graph_data["num_covalent_bonds"]
+
+        edge_index_1 = graph_data["edge_index"][:, :num_covalent]
+        edge_index_2 = graph_data["edge_index"]
+
+        edge_weight_2 = graph_data["edge_weight"]
+        edge_type_2 = graph_data["edge_type"]
+
+        # ---------------------------
+        # Create PyG data object
+        # ---------------------------
+        data = ComplexData(
+            x=torch.from_numpy(graph_data["node_feat"]).to(torch.float32),
+
+            # Branch 1: covalent-only graph
+            edge_index_1=torch.from_numpy(edge_index_1).to(torch.long),
+
+            # Branch 2: full graph
+            edge_index_2=torch.from_numpy(edge_index_2).to(torch.long),
+            edge_weight=torch.from_numpy(edge_weight_2).to(torch.float32),
+            edge_type=torch.from_numpy(edge_type_2).to(torch.long),
+
+            # Target remains raw pK.
+            # Normalization is done only in Trainer using train statistics.
+            y=torch.tensor([binding_affinity], dtype=torch.float32),
+
+            pdb_id=pdb_id,
+        )
+
+        return data, ""
+
     def process(self):
-        data_list = []
-        processed_ids = []
+        n_total = 0
+        n_done_before = 0
+
+        for k in range(self.n_shards):
+            pt_path, json_path = self._shard_paths(k)
+            rows = self._shard_rows(k)
+            n_total += len(rows)
+
+            if os.path.exists(pt_path) and os.path.exists(json_path):
+                n_done_before += 1
+                continue
+
+            data_list = []
+            processed_ids = []
+            skipped = {}
+
+            for row in tqdm(
+                rows.itertuples(),
+                total=len(rows),
+                desc=f"Processing shard {k + 1}/{self.n_shards}",
+            ):
+                data, reason = self._build_graph(row)
+
+                if data is None:
+                    skipped[row.pdb_id] = reason
+                    continue
+
+                data_list.append(data)
+                processed_ids.append(row.pdb_id)
+
+            if data_list:
+                if hasattr(InMemoryDataset, "save"):
+                    InMemoryDataset.save(data_list, pt_path)
+                else:
+                    torch.save(InMemoryDataset.collate(data_list), pt_path)
+            else:
+                torch.save(None, pt_path)
+
+            del data_list
+
+            # The .json is written last: if it exists, the .pt is complete.
+            with open(json_path, "w") as f:
+                json.dump(
+                    {"ids": list(rows["pdb_id"]), "processed": processed_ids, "skipped": skipped},
+                    f,
+                    indent=1,
+                )
+
+        # ---------------------------
+        # Summary over all shards
+        # ---------------------------
+        n_processed = 0
         skipped = {}
+        for k in range(self.n_shards):
+            with open(self._shard_paths(k)[1]) as f:
+                info = json.load(f)
+            n_processed += len(info["processed"])
+            skipped.update(info["skipped"])
 
-        rows = self._rows_to_process()
-
-        for row in tqdm(rows.itertuples(), total=len(rows), desc="Processing Pockets"):
-            pdb_id = row.pdb_id
-            binding_affinity = float(row.pk)
-
-            # ---------------------------
-            # Load ligand and pocket
-            # ---------------------------
-            ligand = self._load_ligand(os.path.join(self.data_dir, row.ligand_file))
-
-            if ligand is None:
-                skipped[pdb_id] = "ligand_parse_failed"
-                continue
-
-            pocket = self._load_pocket(os.path.join(self.data_dir, row.pocket_file))
-
-            if pocket is None:
-                skipped[pdb_id] = "pocket_parse_failed"
-                continue
-
-            # ---------------------------
-            # Build graphs
-            # ---------------------------
-            ligand_graph = ligand_to_graph(ligand)
-            protein_graph = protein_to_graph(pocket)
-
-            if ligand_graph is None or protein_graph is None:
-                skipped[pdb_id] = "no_coordinates"
-                continue
-
-            graph_data = covalent_and_intermolecular_interactions_graph(
-                ligand_graph,
-                protein_graph,
-            )
-
-            if graph_data is None:
-                skipped[pdb_id] = "bad_graph"
-                continue
-
-            # ---------------------------
-            # Split graph into two branches
-            # ---------------------------
-            num_covalent = graph_data["num_covalent_bonds"]
-
-            edge_index_1 = graph_data["edge_index"][:, :num_covalent]
-            edge_index_2 = graph_data["edge_index"]
-
-            edge_weight_2 = graph_data["edge_weight"]
-            edge_type_2 = graph_data["edge_type"]
-
-            # ---------------------------
-            # Create PyG data object
-            # ---------------------------
-            data = ComplexData(
-                x=torch.from_numpy(graph_data["node_feat"]).to(torch.float32),
-
-                # Branch 1: covalent-only graph
-                edge_index_1=torch.from_numpy(edge_index_1).to(torch.long),
-
-                # Branch 2: full graph
-                edge_index_2=torch.from_numpy(edge_index_2).to(torch.long),
-                edge_weight=torch.from_numpy(edge_weight_2).to(torch.float32),
-                edge_type=torch.from_numpy(edge_type_2).to(torch.long),
-
-                # Target remains raw pK.
-                # Normalization is done only in Trainer using train statistics.
-                y=torch.tensor([binding_affinity], dtype=torch.float32),
-
-                pdb_id=pdb_id,
-            )
-
-            data_list.append(data)
-            processed_ids.append(pdb_id)
-
-        if not data_list:
+        if n_processed == 0:
             raise RuntimeError(
                 "No data processed. Check data_dir and complexes.csv."
             )
 
         print("\n--- Dataset processing summary ---")
-        print(f"Complexes in table with structure and label: {len(rows)}")
-        print(f"Processed:                                   {len(data_list)}")
+        if n_done_before:
+            print(f"Shards reused from a previous run:           {n_done_before}/{self.n_shards}")
+        print(f"Complexes in table with structure and label: {n_total}")
+        print(f"Processed:                                   {n_processed}")
         print(f"Skipped:                                     {len(skipped)}")
         for reason in sorted(set(skipped.values())):
             n = sum(1 for r in skipped.values() if r == reason)
             print(f"  {reason:<28}{n}")
 
-        self._save_graphs(data_list, self.processed_paths[0])
-
-        with open(self.processed_paths[1], "w") as f:
-            json.dump({"processed": processed_ids, "skipped": skipped}, f, indent=1)
-
     def get(self, idx):
-        data = super().get(idx)
+        k = bisect.bisect_right(self._offsets, idx) - 1
+        data = self._shards[k].get(idx - self._offsets[k])
 
         # ---------------------------
         # Attach ESM vector

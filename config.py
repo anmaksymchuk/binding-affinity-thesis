@@ -40,6 +40,10 @@ class Config:
     # file) whenever graph building or the label source changes.
     dataset_tag = f"v2020R1_cleansplit_{label_source}"
 
+    # Graphs are built and saved in shards of this many complexes
+    # (saving all ~17k at once ran out of RAM on Colab).
+    graph_shard_size = 1000
+
     # CleanSplit ID lists (copied from the GEMS repo, see splits/cleansplit/README.md)
     split_dir = os.path.join(project_dir, "splits", "cleansplit")
     split_file = os.path.join(split_dir, "PDBbind_data_split_cleansplit.json")
