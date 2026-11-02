@@ -6,7 +6,7 @@ class Config:
     # ============================================================
     # Experiment
     # ============================================================
-    model_type = "gnn_vqc"      # "full", "gnn_only", "gnn_vqc", or "esm_only"
+    model_type = "gnn_only"     # "full", "gnn_only", "gnn_vqc", or "esm_only"
     #experiment_name = model_type
     experiment_name = f"{model_type}"
 
