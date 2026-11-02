@@ -388,7 +388,10 @@ def main():
         y_stats=y_stats,
         grad_clip_norm=config.grad_clip_norm,
         checkpoint_path=config.best_model_path,
+        use_amp=getattr(config, "use_amp", False) and model_type != "gnn_vqc",
     )
+
+    print(f"Mixed precision (AMP): {trainer.use_amp}")
 
     # ---------------------------
     # Training

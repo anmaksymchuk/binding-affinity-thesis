@@ -15,6 +15,7 @@ class Trainer:
         y_stats=None,
         grad_clip_norm=1.0,
         checkpoint_path="best_model_rmse.pt",
+        use_amp=False,
     ):
         self.model = model
         self.device = device
@@ -24,6 +25,11 @@ class Trainer:
         self.y_stats = y_stats
         self.grad_clip_norm = grad_clip_norm
         self.checkpoint_path = checkpoint_path
+
+        # Mixed precision (float16 autocast + GradScaler), CUDA only.
+        # With use_amp=False both are no-ops and training is plain float32.
+        self.use_amp = bool(use_amp) and str(device).startswith("cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         if self.y_stats is None:
             raise ValueError(
@@ -66,19 +72,23 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             y_norm = self.normalize_y(batch.y).view(-1)
-            pred_norm = self.model(batch).view(-1)
 
-            loss = self.criterion(pred_norm, y_norm)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
+                pred_norm = self.model(batch).view(-1)
 
-            loss.backward()
+            loss = self.criterion(pred_norm.float(), y_norm)
+
+            self.scaler.scale(loss).backward()
 
             if self.grad_clip_norm is not None:
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.grad_clip_norm,
                 )
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += loss.item()
             num_batches += 1
@@ -152,7 +162,8 @@ class Trainer:
             for batch in loader:
                 batch = batch.to(self.device)
 
-                pred_norm = self.model(batch).view(-1)
+                with torch.autocast("cuda", dtype=torch.float16, enabled=self.use_amp):
+                    pred_norm = self.model(batch).view(-1).float()
 
                 ys_raw.append(batch.y.view(-1).cpu().numpy())
                 preds_norm.append(pred_norm.cpu().numpy())

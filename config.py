@@ -126,6 +126,10 @@ class Config:
     weight_decay = 1e-3
 
     criterion_type = "huber"
+
+    # Mixed precision (float16) on GPU: about the same accuracy, faster on T4.
+    # Not used for gnn_vqc (the quantum layer needs float32).
+    use_amp = True
     grad_clip_norm = 1.0
 
     # ============================================================
