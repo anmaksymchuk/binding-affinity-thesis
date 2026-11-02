@@ -129,7 +129,7 @@ class Trainer:
 
         return float(np.corrcoef(y_true, y_pred)[0, 1])
 
-    def eval_step(self, loader):
+    def eval_step(self, loader, return_predictions=False):
         """
         Evaluation step.
 
@@ -138,11 +138,15 @@ class Trainer:
             MAE
             CI
             Pearson
+
+        With return_predictions=True also returns a dict with per-complex
+        pdb_id, y_true and y_pred (for error analysis).
         """
         self.model.eval()
 
         ys_raw = []
         preds_norm = []
+        pdb_ids = []
 
         with torch.inference_mode():
             for batch in loader:
@@ -152,6 +156,10 @@ class Trainer:
 
                 ys_raw.append(batch.y.view(-1).cpu().numpy())
                 preds_norm.append(pred_norm.cpu().numpy())
+
+                if return_predictions:
+                    ids = batch.pdb_id
+                    pdb_ids.extend([ids] if isinstance(ids, str) else list(ids))
 
         ys_raw = np.concatenate(ys_raw)
         preds_norm = np.concatenate(preds_norm)
@@ -163,12 +171,23 @@ class Trainer:
         ci = self.concordance_index(ys_raw, preds_raw)
         pearson = self.pearson_corr(ys_raw, preds_raw)
 
-        return {
+        metrics = {
             "rmse": float(rmse),
             "mae": float(mae),
             "ci": float(ci),
             "pearson": float(pearson),
         }
+
+        if not return_predictions:
+            return metrics
+
+        predictions = {
+            "pdb_id": pdb_ids,
+            "y_true": ys_raw.tolist(),
+            "y_pred": preds_raw.tolist(),
+        }
+
+        return metrics, predictions
 
     def train(
         self,
