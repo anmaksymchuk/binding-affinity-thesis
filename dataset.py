@@ -1,12 +1,13 @@
 import os
+import json
 import torch
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import MolFromPDBFile, MolFromMol2File
 from torch_geometric.data import InMemoryDataset, Data
 
+from cleansplit import load_complexes_table
 from utils import (
-    get_binding_affinity,
     ligand_to_graph,
     protein_to_graph,
     covalent_and_intermolecular_interactions_graph,
@@ -33,18 +34,31 @@ class ComplexData(Data):
 
 
 class Ligand_Protein_Dataset(InMemoryDataset):
+    """
+    Graphs for all complexes listed in complexes.csv (built by cleansplit.py)
+    that have structure files and a label.
+
+    Label filters (censored / approximate) are NOT applied here, so changing
+    them in config does not require rebuilding the graphs; main.py selects IDs.
+
+    Next to the graph file, processed/<tag>_index.json records which IDs were
+    processed and why the others were skipped.
+    """
+
     def __init__(
         self,
         root,
         data_dir,
-        affinity_file,
+        complexes_csv,
+        dataset_tag,
         esm_path=None,
         esm_dim=320,
         transform=None,
         pre_transform=None,
     ):
         self.data_dir = data_dir
-        self.affinity_file = affinity_file
+        self.complexes_csv = complexes_csv
+        self.dataset_tag = dataset_tag
         self.esm_dim = esm_dim
 
         # ---------------------------
@@ -64,32 +78,67 @@ class Ligand_Protein_Dataset(InMemoryDataset):
 
         super().__init__(root, transform, pre_transform)
 
-        self.data, self.slices = torch.load(
-            self.processed_paths[0],
-            weights_only=False,
-        )
+        self._load_graphs(self.processed_paths[0])
+
+        with open(self.processed_paths[1]) as f:
+            index = json.load(f)
+
+        self.processed_ids = index["processed"]
+        self.skipped = index["skipped"]
+
+        self._check_cache_matches_table()
 
     @property
     def processed_file_names(self):
-        """
-        Important:
-        The filename is changed because the graph structure now includes edge_type.
-        If we kept the old name, PyG could silently load the old processed dataset.
-        """
-        return ["ds_pocket_refined_pKd_v2_edge_type.pt"]
+        return [
+            f"graphs_{self.dataset_tag}.pt",
+            f"graphs_{self.dataset_tag}_index.json",
+        ]
 
-    def _load_ligand(self, complex_dir, pdb_id):
-        """
-        Try loading ligand from MOL2 first, then SDF.
-        """
-        ligand_path = os.path.join(
-            complex_dir,
-            f"{pdb_id}_ligand.mol2",
-        )
+    # ---------------------------
+    # Save / load (PyG >= 2.4 has InMemoryDataset.save/load)
+    # ---------------------------
+    def _save_graphs(self, data_list, path):
+        if hasattr(InMemoryDataset, "save"):
+            self.save(data_list, path)
+        else:
+            torch.save(self.collate(data_list), path)
 
+    def _load_graphs(self, path):
+        if hasattr(InMemoryDataset, "load"):
+            self.load(path)
+        else:
+            self.data, self.slices = torch.load(path, weights_only=False)
+
+    def _rows_to_process(self):
+        table = load_complexes_table(self.complexes_csv)
+        return table[table["has_structure"] & table["pk"].notna()]
+
+    def _check_cache_matches_table(self):
+        """
+        The graph file is cached by name only; make sure it still covers the
+        current complexes.csv.
+        """
+        wanted = set(self._rows_to_process()["pdb_id"])
+        known = set(self.processed_ids) | set(self.skipped)
+        not_in_cache = wanted - known
+
+        if not_in_cache:
+            raise RuntimeError(
+                f"{len(not_in_cache)} complexes from {self.complexes_csv} are not in "
+                f"the cached graphs {self.processed_paths[0]} "
+                f"(e.g. {sorted(not_in_cache)[:5]}). Delete the two files "
+                f"{self.processed_file_names} in {self.processed_dir} to rebuild."
+            )
+
+    def _load_ligand(self, ligand_path):
+        """
+        Load ligand from MOL2 or SDF. If the MOL2 file fails to parse,
+        try the SDF file next to it.
+        """
         ligand = None
 
-        if os.path.exists(ligand_path):
+        if ligand_path.endswith(".mol2") and os.path.exists(ligand_path):
             ligand = MolFromMol2File(
                 ligand_path,
                 sanitize=True,
@@ -99,10 +148,7 @@ class Ligand_Protein_Dataset(InMemoryDataset):
         if ligand is not None:
             return ligand
 
-        sdf_path = os.path.join(
-            complex_dir,
-            f"{pdb_id}_ligand.sdf",
-        )
+        sdf_path = ligand_path[: -len(".mol2")] + ".sdf" if ligand_path.endswith(".mol2") else ligand_path
 
         if os.path.exists(sdf_path):
             suppl = Chem.SDMolSupplier(
@@ -116,15 +162,10 @@ class Ligand_Protein_Dataset(InMemoryDataset):
 
         return ligand
 
-    def _load_pocket(self, complex_dir, pdb_id):
+    def _load_pocket(self, pocket_path):
         """
         Load protein pocket from PDB file.
         """
-        pocket_path = os.path.join(
-            complex_dir,
-            f"{pdb_id}_pocket.pdb",
-        )
-
         if not os.path.exists(pocket_path):
             return None
 
@@ -138,50 +179,28 @@ class Ligand_Protein_Dataset(InMemoryDataset):
 
     def process(self):
         data_list = []
-        map_complex_to_affinity = get_binding_affinity(self.affinity_file)
+        processed_ids = []
+        skipped = {}
 
-        folders = [
-            folder
-            for folder in os.listdir(self.data_dir)
-            if not folder.startswith(".")
-        ]
+        rows = self._rows_to_process()
 
-        folders = sorted(folders)
-
-        skipped_no_affinity = 0
-        skipped_no_ligand = 0
-        skipped_no_pocket = 0
-        skipped_bad_graph = 0
-
-        for complex_folder_name in tqdm(folders, desc="Processing Pockets"):
-            pdb_id = complex_folder_name
-            complex_dir = os.path.join(self.data_dir, complex_folder_name)
-
-            if not os.path.isdir(complex_dir):
-                continue
-
-            # ---------------------------
-            # Check affinity first
-            # ---------------------------
-            if pdb_id not in map_complex_to_affinity:
-                skipped_no_affinity += 1
-                continue
-
-            binding_affinity = map_complex_to_affinity[pdb_id]
+        for row in tqdm(rows.itertuples(), total=len(rows), desc="Processing Pockets"):
+            pdb_id = row.pdb_id
+            binding_affinity = float(row.pk)
 
             # ---------------------------
             # Load ligand and pocket
             # ---------------------------
-            ligand = self._load_ligand(complex_dir, pdb_id)
+            ligand = self._load_ligand(os.path.join(self.data_dir, row.ligand_file))
 
             if ligand is None:
-                skipped_no_ligand += 1
+                skipped[pdb_id] = "ligand_parse_failed"
                 continue
 
-            pocket = self._load_pocket(complex_dir, pdb_id)
+            pocket = self._load_pocket(os.path.join(self.data_dir, row.pocket_file))
 
             if pocket is None:
-                skipped_no_pocket += 1
+                skipped[pdb_id] = "pocket_parse_failed"
                 continue
 
             # ---------------------------
@@ -191,7 +210,7 @@ class Ligand_Protein_Dataset(InMemoryDataset):
             protein_graph = protein_to_graph(pocket)
 
             if ligand_graph is None or protein_graph is None:
-                skipped_bad_graph += 1
+                skipped[pdb_id] = "no_coordinates"
                 continue
 
             graph_data = covalent_and_intermolecular_interactions_graph(
@@ -200,7 +219,7 @@ class Ligand_Protein_Dataset(InMemoryDataset):
             )
 
             if graph_data is None:
-                skipped_bad_graph += 1
+                skipped[pdb_id] = "bad_graph"
                 continue
 
             # ---------------------------
@@ -228,7 +247,7 @@ class Ligand_Protein_Dataset(InMemoryDataset):
                 edge_weight=torch.from_numpy(edge_weight_2).to(torch.float32),
                 edge_type=torch.from_numpy(edge_type_2).to(torch.long),
 
-                # Target remains raw pKd.
+                # Target remains raw pK.
                 # Normalization is done only in Trainer using train statistics.
                 y=torch.tensor([binding_affinity], dtype=torch.float32),
 
@@ -236,25 +255,25 @@ class Ligand_Protein_Dataset(InMemoryDataset):
             )
 
             data_list.append(data)
+            processed_ids.append(pdb_id)
 
         if not data_list:
             raise RuntimeError(
-                "No data processed. Check paths, affinity file, and structure files."
+                "No data processed. Check data_dir and complexes.csv."
             )
 
         print("\n--- Dataset processing summary ---")
-        print(f"Processed complexes:      {len(data_list)}")
-        print(f"Skipped no affinity:      {skipped_no_affinity}")
-        print(f"Skipped no ligand:        {skipped_no_ligand}")
-        print(f"Skipped no pocket:        {skipped_no_pocket}")
-        print(f"Skipped bad graph:        {skipped_bad_graph}")
+        print(f"Complexes in table with structure and label: {len(rows)}")
+        print(f"Processed:                                   {len(data_list)}")
+        print(f"Skipped:                                     {len(skipped)}")
+        for reason in sorted(set(skipped.values())):
+            n = sum(1 for r in skipped.values() if r == reason)
+            print(f"  {reason:<28}{n}")
 
-        data, slices = self.collate(data_list)
+        self._save_graphs(data_list, self.processed_paths[0])
 
-        torch.save(
-            (data, slices),
-            self.processed_paths[0],
-        )
+        with open(self.processed_paths[1], "w") as f:
+            json.dump({"processed": processed_ids, "skipped": skipped}, f, indent=1)
 
     def get(self, idx):
         data = super().get(idx)

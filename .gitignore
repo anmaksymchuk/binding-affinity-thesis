@@ -1,6 +1,8 @@
 # --- Данные (PDBbind и индексы не публикуем: лицензия + размер) ---
 refined_set/
 PDBbind_2016/
+PDBbind_v2020R1/
+data/
 *.pdb
 *.sdf
 *.mol2

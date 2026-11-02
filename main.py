@@ -1,7 +1,9 @@
 import os
+import json
 import random
 import torch
 import numpy as np
+import pandas as pd
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -16,7 +18,8 @@ from model import (
 from dataset import Ligand_Protein_Dataset
 from trainer import Trainer
 from config import Config
-from utils import compute_dataset_stats, get_pdb_ids_from_index
+from utils import compute_dataset_stats
+from cleansplit import load_complexes_table, make_split, sha256_of, fold_file
 
 from rdkit import RDLogger
 
@@ -69,10 +72,13 @@ def main():
     # ---------------------------
     print(f"\n--- Loading Dataset from {config.data_dir} ---")
 
+    table = load_complexes_table(config.complexes_csv)
+
     dataset = Ligand_Protein_Dataset(
         root=config.root,
         data_dir=config.data_dir,
-        affinity_file=config.affinity_file,
+        complexes_csv=config.complexes_csv,
+        dataset_tag=config.dataset_tag,
         esm_path=config.esm_path,
         esm_dim=config.esm_dim,
     )
@@ -82,13 +88,13 @@ def main():
     if dataset_size == 0:
         raise RuntimeError("Dataset is empty.")
 
-    print(f"Total complexes: {dataset_size}")
+    print(f"Total processed complexes: {dataset_size}")
 
     # ---------------------------
     # Collect processed PDB IDs
     # ---------------------------
-    all_indices = np.arange(dataset_size)
     pdb_ids = []
+    y_cached = []
 
     for i in range(dataset_size):
         data_i = dataset.get(i)
@@ -98,133 +104,60 @@ def main():
             pdb_id = pdb_id[0]
 
         pdb_ids.append(str(pdb_id).lower())
+        y_cached.append(float(data_i.y.view(-1)[0]))
 
     pdb_ids = np.array(pdb_ids)
+    id_to_idx = {pdb_id: i for i, pdb_id in enumerate(pdb_ids)}
 
-    # ---------------------------
-    # Train / Val / Test split
-    # ---------------------------
-    if getattr(config, "use_core_test_split", False):
-        # CASF-style split:
-        #   Test = Core set
-        #   Train/Val = Refined set minus Core set
+    if len(id_to_idx) != len(pdb_ids):
+        raise RuntimeError("Duplicate PDB IDs in the processed dataset.")
 
-        if not os.path.exists(config.core_index_file):
-            raise FileNotFoundError(
-                f"Core index file not found: {config.core_index_file}"
-            )
-
-        core_ids = get_pdb_ids_from_index(config.core_index_file)
-
-        print("\n--- CASF-style core split ---")
-        print(f"Core IDs in index file: {len(core_ids)}")
-
-        processed_ids = set(pdb_ids.tolist())
-        core_ids_found = core_ids & processed_ids
-        missing_core_ids = core_ids - processed_ids
-
-        print(f"Core IDs found in processed dataset: {len(core_ids_found)}")
-
-        if missing_core_ids:
-            print(
-                f"Warning: {len(missing_core_ids)} core complexes are absent "
-                "from the processed dataset."
-            )
-            print(f"Missing core IDs: {sorted(missing_core_ids)}")
-
-        test_mask = np.array([pdb_id in core_ids for pdb_id in pdb_ids])
-
-        test_idx = all_indices[test_mask]
-        train_val_idx = all_indices[~test_mask]
-
-        if len(test_idx) == 0:
-            raise RuntimeError(
-                "No core complexes were found in the processed refined dataset. "
-                "Check INDEX_core_data.2016 and pdb_id names."
-            )
-
-        if len(train_val_idx) == 0:
-            raise RuntimeError(
-                "Train/val split is empty after removing core complexes."
-            )
-
-        # Shuffle only refined-minus-core candidates
-        np.random.shuffle(train_val_idx)
-
-        val_size = int(len(train_val_idx) * config.val_split)
-
-        if val_size == 0:
-            raise ValueError(
-                "Validation split is empty. Increase val_split or check dataset size."
-            )
-
-        val_idx = train_val_idx[:val_size]
-        train_idx = train_val_idx[val_size:]
-
-        print(
-            f"CASF-style split: "
-            f"Train={len(train_idx)}, "
-            f"Val={len(val_idx)}, "
-            f"Test/Core={len(test_idx)}"
-        )
-
-    else:
-        # Original random split over the full refined set
-        print("\n--- Random refined-set split ---")
-
-        indices = np.arange(dataset_size)
-        np.random.shuffle(indices)
-
-        val_size = int(dataset_size * config.val_split)
-        test_size = int(dataset_size * config.test_split)
-
-        if val_size == 0 or test_size == 0:
-            raise ValueError(
-                "Validation or test split is empty. "
-                "Increase dataset size or split ratio."
-            )
-
-        val_idx = indices[:val_size]
-        test_idx = indices[val_size:val_size + test_size]
-        train_idx = indices[val_size + test_size:]
-
-        print(
-            f"Random split: "
-            f"Train={len(train_idx)}, "
-            f"Val={len(val_idx)}, "
-            f"Test={len(test_idx)}"
-        )
-
-    if len(train_idx) == 0:
-        raise ValueError("Training split is empty.")
-
-    # ---------------------------
-    # Leakage checks
-    # ---------------------------
-    train_ids = set(pdb_ids[train_idx])
-    val_ids = set(pdb_ids[val_idx])
-    test_ids = set(pdb_ids[test_idx])
-
-    train_val_overlap = train_ids & val_ids
-    train_test_overlap = train_ids & test_ids
-    val_test_overlap = val_ids & test_ids
-
-    if train_val_overlap:
+    # Labels in the cached graphs must match complexes.csv
+    pk_table = dict(zip(table["pdb_id"], table["pk"]))
+    stale = [
+        str(pdb_id) for pdb_id, y in zip(pdb_ids, y_cached)
+        if not abs(pk_table.get(pdb_id, np.nan) - y) < 1e-4
+    ]
+    if stale:
         raise RuntimeError(
-            f"Train/Val overlap found: {sorted(train_val_overlap)[:10]}"
+            f"{len(stale)} cached labels differ from {config.complexes_csv} "
+            f"(e.g. {stale[:5]}). Delete processed/graphs_{config.dataset_tag}* "
+            "to rebuild the graphs."
         )
 
-    if train_test_overlap:
-        raise RuntimeError(
-            f"Train/Test overlap found: {sorted(train_test_overlap)[:10]}"
+    # ---------------------------
+    # CleanSplit: Train / Val / Tests by PDB ID
+    # ---------------------------
+    split = make_split(table, set(pdb_ids), config, skipped=dataset.skipped)
+
+    train_ids = split["train_ids"]
+    val_ids = split["val_ids"]
+    test_ids = split["test_ids"]
+
+    if config.main_test_set not in test_ids:
+        raise ValueError(
+            f"main_test_set={config.main_test_set} is not in test_sets={config.test_sets}"
         )
 
-    if val_test_overlap:
-        raise RuntimeError(
-            f"Val/Test overlap found: {sorted(val_test_overlap)[:10]}"
-        )
+    train_idx = np.array([id_to_idx[i] for i in train_ids])
+    val_idx = np.array([id_to_idx[i] for i in val_ids])
+    test_idx = {name: np.array([id_to_idx[i] for i in ids]) for name, ids in test_ids.items()}
 
-    print("Leakage check passed: no PDB ID overlap between train/val/test.")
+    print("\n--- CleanSplit ---")
+    val_desc = (
+        f"GEMS fold {config.fold}" if config.val_mode == "gems_fold"
+        else f"random {config.val_split:.0%} (seed {config.seed})"
+    )
+    print(f"Validation: {val_desc}; labels: {config.label_source}")
+    print(f"Train={len(train_idx)}, Val={len(val_idx)}")
+    for name, idx in test_idx.items():
+        print(f"Test {name}: {len(idx)}")
+
+    for name, c in split["counts"].items():
+        if c["excluded_by_reason"]:
+            print(f"Excluded from {name}: {c['excluded_by_reason']}")
+
+    print("Leakage check passed: no PDB ID overlap between train/val and CASF sets.")
 
     # ---------------------------
     # Save split information
@@ -232,14 +165,33 @@ def main():
     split_info = {
         "seed": config.seed,
         "model_type": model_type,
-        "use_core_test_split": getattr(config, "use_core_test_split", False),
-        "train_ids": sorted(train_ids),
-        "val_ids": sorted(val_ids),
-        "test_ids": sorted(test_ids),
+        "protocol": "PDBbind v2020.R1 + CleanSplit",
+        "label_source": config.label_source,
+        "drop_censored_labels": config.drop_censored_labels,
+        "keep_approx_labels": config.keep_approx_labels,
+        "val_mode": config.val_mode,
+        "fold": config.fold if config.val_mode == "gems_fold" else None,
+        "val_split": config.val_split if config.val_mode == "random" else None,
+        "main_test_set": config.main_test_set,
+        "split_file": os.path.relpath(config.split_file, config.project_dir),
+        "split_file_sha256": sha256_of(config.split_file),
+        "fold_file_sha256": (
+            sha256_of(fold_file(config, config.fold))
+            if config.val_mode == "gems_fold" else None
+        ),
+        "complexes_csv_sha256": sha256_of(config.complexes_csv),
+        "dataset_tag": config.dataset_tag,
+        "counts": split["counts"],
+        "train_ids": train_ids,
+        "val_ids": val_ids,
+        "test_ids": test_ids,
+        "excluded": split["excluded"],
     }
 
-    split_info_path = os.path.join(config.output_dir, "split_info.pt")
-    torch.save(split_info, split_info_path)
+    split_info_path = config.split_info_path
+
+    with open(split_info_path, "w") as f:
+        json.dump(split_info, f, indent=1)
 
     # ---------------------------
     # Target statistics
@@ -261,12 +213,15 @@ def main():
     # ---------------------------
     train_dataset = dataset[train_idx.tolist()]
     val_dataset = dataset[val_idx.tolist()]
-    test_dataset = dataset[test_idx.tolist()]
+    test_datasets = {name: dataset[idx.tolist()] for name, idx in test_idx.items()}
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.train_batch_size,
         shuffle=True,
+        # BatchNorm fails on a last batch of size 1; with the new train size
+        # this can happen, so the incomplete last batch is dropped.
+        drop_last=True,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
     )
@@ -279,13 +234,16 @@ def main():
         pin_memory=config.pin_memory,
     )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.test_batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-    )
+    test_loaders = {
+        name: DataLoader(
+            ds,
+            batch_size=config.test_batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+        )
+        for name, ds in test_datasets.items()
+    }
 
     # ---------------------------
     # Model
@@ -448,24 +406,30 @@ def main():
     )
 
     # ---------------------------
-    # Final evaluation
+    # Final evaluation on all CASF test sets
     # ---------------------------
-    print("\n--- Final Evaluation on Test Set ---")
+    print("\n--- Final Evaluation on Test Sets ---")
 
-    test_metrics = trainer.eval_step(test_loader)
+    test_metrics = {}
+    prediction_frames = []
 
-    test_rmse = test_metrics["rmse"]
-    test_mae = test_metrics["mae"]
-    test_ci = test_metrics["ci"]
-    test_pearson = test_metrics["pearson"]
+    for name, loader in test_loaders.items():
+        metrics, preds = trainer.eval_step(loader, return_predictions=True)
+        test_metrics[name] = {**metrics, "n": len(preds["pdb_id"])}
 
-    print("=" * 50)
-    print("TEST RESULTS (pKd Scale)")
-    print(f"RMSE:    {test_rmse:.4f}")
-    print(f"MAE:     {test_mae:.4f}")
-    print(f"CI:      {test_ci:.4f}")
-    print(f"Pearson: {test_pearson:.4f}")
-    print("=" * 50)
+        df = pd.DataFrame(preds)
+        df.insert(0, "test_set", name)
+        prediction_frames.append(df)
+
+    print("=" * 66)
+    print(f"TEST RESULTS (pK scale), main test set: {config.main_test_set}")
+    print(f"{'set':<16}{'n':>5}{'RMSE':>9}{'MAE':>9}{'CI':>9}{'Pearson':>10}")
+    for name, m in test_metrics.items():
+        print(
+            f"{name:<16}{m['n']:>5}{m['rmse']:>9.4f}{m['mae']:>9.4f}"
+            f"{m['ci']:>9.4f}{m['pearson']:>10.4f}"
+        )
+    print("=" * 66)
 
     # ---------------------------
     # Save artifacts
@@ -474,6 +438,7 @@ def main():
     torch.save(y_stats, config.y_stats_path)
     torch.save(history, config.history_path)
     torch.save(test_metrics, config.test_metrics_path)
+    pd.concat(prediction_frames).to_csv(config.test_predictions_path, index=False)
 
     print("\nSaved files:")
     print(f"  - {config.best_model_path}")
@@ -481,6 +446,7 @@ def main():
     print(f"  - {config.y_stats_path}")
     print(f"  - {config.history_path}")
     print(f"  - {config.test_metrics_path}")
+    print(f"  - {config.test_predictions_path}")
     print(f"  - {split_info_path}")
     print("\nAll saved. Done!")
 
