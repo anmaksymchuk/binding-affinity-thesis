@@ -50,4 +50,4 @@ python main.py
 | `test_predictions.csv` | Предсказания по комплексам: `test_set, pdb_id, y_true, y_pred` |
 | `best_model_rmse.pt`, `model_final_pKd.pt`, `y_stats.pt`, `training_history.pt` | Как раньше |
 
-Причины, по которым графы не построились, лежат в `processed/graphs_<tag>_index.json`.
+Графы сохраняются частями по 1000 комплексов: `processed/graphs_<tag>_shardNNN.pt` и `.json` (в `.json` лежат ID части и причины, по которым графы не построились). Если построение прервалось, готовые части при следующем запуске используются повторно.

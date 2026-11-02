@@ -79,6 +79,7 @@ def main():
         data_dir=config.data_dir,
         complexes_csv=config.complexes_csv,
         dataset_tag=config.dataset_tag,
+        shard_size=config.graph_shard_size,
         esm_path=config.esm_path,
         esm_dim=config.esm_dim,
     )
