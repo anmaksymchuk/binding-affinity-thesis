@@ -90,7 +90,17 @@ def main():
 
     torch.save(metrics_all, os.path.join(out_dir, "test_metrics.pt"))
     pd.concat(frames).to_csv(os.path.join(out_dir, "test_predictions.csv"), index=False)
-    print(f"Saved test_metrics.pt and test_predictions.csv to {out_dir}")
+
+    # Validation predictions (for error vs. similarity analysis)
+    loader = DataLoader(ds[[id_to_idx[i] for i in split["val_ids"]]], batch_size=c.test_batch_size)
+    metrics, preds = trainer.eval_step(loader, return_predictions=True)
+    print(f"{'val':<16}{len(split['val_ids']):>5}{metrics['rmse']:>9.4f}{metrics['mae']:>9.4f}"
+          f"{metrics['ci']:>9.4f}{metrics['pearson']:>10.4f}")
+    df = pd.DataFrame(preds)
+    df.insert(0, "test_set", "val")
+    df.to_csv(os.path.join(out_dir, "val_predictions.csv"), index=False)
+
+    print(f"Saved test_metrics.pt, test_predictions.csv and val_predictions.csv to {out_dir}")
 
 
 if __name__ == "__main__":
