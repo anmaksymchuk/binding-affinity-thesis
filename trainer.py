@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -207,15 +208,23 @@ class Trainer:
         val_loader,
         early_stop=True,
         patience=15,
+        resume_path=None,
+        run_id=None,
     ):
         """
         Full training loop.
 
         Early stopping is based on validation RMSE.
         The best model is saved to self.checkpoint_path.
+
+        If resume_path is given, the full training state is saved there after
+        every epoch, and training continues from it if the file already exists.
+        run_id (e.g. a hash of the split) guards against resuming a different run.
         """
         best_rmse = float("inf")
         counter = patience
+        start_epoch = 0
+        finished = False
 
         history = {
             "train_loss": [],
@@ -225,9 +234,36 @@ class Trainer:
             "val_pearson": [],
         }
 
+        if resume_path is not None and os.path.exists(resume_path):
+            state = torch.load(resume_path, map_location=self.device, weights_only=False)
+            if run_id is not None and state.get("run_id") != run_id:
+                raise RuntimeError(
+                    f"{resume_path} belongs to a different run (other split or settings). "
+                    "Move it away or change the output folder."
+                )
+            self.model.load_state_dict(state["model"])
+            self.optimizer.load_state_dict(state["optimizer"])
+            if self.scheduler is not None and state.get("scheduler") is not None:
+                self.scheduler.load_state_dict(state["scheduler"])
+            self.scaler.load_state_dict(state["scaler"])
+            best_rmse = state["best_rmse"]
+            counter = state["counter"]
+            history = state["history"]
+            start_epoch = state["epoch"] + 1
+            finished = state.get("finished", False)
+            self._set_rng_state(state["rng"])
+            print(
+                f"Resuming from {resume_path}: epoch {state['epoch']:03d} done, "
+                f"best val RMSE {best_rmse:.4f}, "
+                f"lr {self.optimizer.param_groups[0]['lr']:.2e}"
+                + (" (training already finished)" if finished else "")
+            )
+
         print(f"Starting training on {self.device}...")
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
+            if finished:
+                break
             train_loss = self.train_step(train_loader)
             val_metrics = self.eval_step(val_loader)
 
@@ -265,7 +301,14 @@ class Trainer:
                 f"{status}"
             )
 
-            if early_stop and counter <= 0:
+            stop = early_stop and counter <= 0
+            if resume_path is not None:
+                self._save_state(
+                    resume_path, epoch, best_rmse, counter, history,
+                    finished=stop or epoch == epochs - 1, run_id=run_id,
+                )
+
+            if stop:
                 print("\nEarly stopping triggered.")
                 break
 
@@ -284,3 +327,36 @@ class Trainer:
             )
 
         return self.model, history
+
+    def _save_state(self, path, epoch, best_rmse, counter, history, finished, run_id):
+        state = {
+            "epoch": epoch,
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            "scaler": self.scaler.state_dict(),
+            "best_rmse": best_rmse,
+            "counter": counter,
+            "history": history,
+            "finished": finished,
+            "run_id": run_id,
+            "rng": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+        }
+        # Write to a temporary file first, so a disconnect during saving
+        # cannot leave a broken checkpoint.
+        tmp = path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _set_rng_state(rng):
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch"].cpu())
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
