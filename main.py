@@ -1,6 +1,7 @@
 import os
 import json
 import random
+import hashlib
 import torch
 import numpy as np
 import pandas as pd
@@ -80,6 +81,7 @@ def main():
         complexes_csv=config.complexes_csv,
         dataset_tag=config.dataset_tag,
         shard_size=config.graph_shard_size,
+        pocket_hydrogens=config.pocket_hydrogens,
         esm_path=config.esm_path,
         esm_dim=config.esm_dim,
     )
@@ -189,6 +191,17 @@ def main():
         "excluded": split["excluded"],
     }
 
+    # Do not overwrite the best model of an earlier run that cannot be resumed.
+    resume_path = config.last_checkpoint_path if getattr(config, "resume", False) else None
+    if os.path.exists(config.best_model_path) and not (
+        resume_path and os.path.exists(resume_path)
+    ):
+        raise RuntimeError(
+            f"{config.output_dir} already holds best_model_rmse.pt from an earlier run "
+            "without last_checkpoint.pt, so it cannot be resumed. "
+            "Rename or move that folder before starting a new run."
+        )
+
     split_info_path = config.split_info_path
 
     with open(split_info_path, "w") as f:
@@ -208,6 +221,10 @@ def main():
 
     if y_stats["std"] < 1e-8:
         raise ValueError("Target std is too small. Cannot normalize y safely.")
+
+    # Saved now (not only at the end), so tools/evaluate.py can use it
+    # even if the run is interrupted.
+    torch.save(y_stats, config.y_stats_path)
 
     # ---------------------------
     # DataLoaders
@@ -388,7 +405,33 @@ def main():
         y_stats=y_stats,
         grad_clip_norm=config.grad_clip_norm,
         checkpoint_path=config.best_model_path,
+        use_amp=getattr(config, "use_amp", False) and model_type != "gnn_vqc",
     )
+
+    print(f"Mixed precision (AMP): {trainer.use_amp}")
+
+    # ---------------------------
+    # Resume support
+    # ---------------------------
+    # Identifies the run: same split, model and training settings.
+    run_id = hashlib.sha256(
+        json.dumps(
+            {
+                "train_ids": train_ids,
+                "val_ids": val_ids,
+                "model_type": model_type,
+                "dataset_tag": config.dataset_tag,
+                "lr": config.learning_rate,
+                "batch_size": config.train_batch_size,
+                "use_amp": trainer.use_amp,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+    if resume_path:
+        print(f"Resume checkpoint: {resume_path}"
+              + (" (found, continuing)" if os.path.exists(resume_path) else " (new run)"))
 
     # ---------------------------
     # Training
@@ -404,6 +447,8 @@ def main():
         val_loader=val_loader,
         early_stop=config.early_stop,
         patience=config.patience,
+        resume_path=resume_path,
+        run_id=run_id,
     )
 
     # ---------------------------

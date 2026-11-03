@@ -38,7 +38,16 @@ class Config:
 
     # Name of the cached graph file in processed/. Change it (or delete the
     # file) whenever graph building or the label source changes.
-    dataset_tag = f"v2020R1_cleansplit_{label_source}"
+    # Hydrogens of the pocket kept as graph nodes:
+    #   "all"   - every H in the file (R1 pockets: ~48% of atoms are H)
+    #   "polar" - only H on N/O/S (like the 2016 pocket files)
+    #   "none"  - heavy atoms only; H counts stay as an atom feature
+    # Changing it builds a new graph cache (new dataset_tag).
+    pocket_hydrogens = "all"
+
+    dataset_tag = f"v2020R1_cleansplit_{label_source}" + (
+        "" if pocket_hydrogens == "all" else f"_pocketH-{pocket_hydrogens}"
+    )
 
     # Graphs are built and saved in shards of this many complexes
     # (saving all ~17k at once ran out of RAM on Colab).
@@ -126,6 +135,10 @@ class Config:
     weight_decay = 1e-3
 
     criterion_type = "huber"
+
+    # Mixed precision (float16) on GPU: about the same accuracy, faster on T4.
+    # Not used for gnn_vqc (the quantum layer needs float32).
+    use_amp = False
     grad_clip_norm = 1.0
 
     # ============================================================
@@ -155,3 +168,9 @@ class Config:
     test_metrics_path = os.path.join(output_dir, "test_metrics.pt")
     test_predictions_path = os.path.join(output_dir, "test_predictions.csv")
     split_info_path = os.path.join(output_dir, "split_info.json")
+
+    # Full training state (model, optimizer, scheduler, epoch, history),
+    # written after every epoch. If it exists, main.py continues from it,
+    # so a run interrupted by a Colab disconnect can be restarted as is.
+    last_checkpoint_path = os.path.join(output_dir, "last_checkpoint.pt")
+    resume = True
