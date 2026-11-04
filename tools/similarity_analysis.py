@@ -22,6 +22,19 @@ For every complex of val, each CASF set and a random sample of train
     knn5_pred                    GEMS search baseline on OUR train set:
                                  weighted mean pK of the 5 training complexes
                                  with the highest Tanimoto + TM-score
+    nn_*                         the nearest neighbour by Tanimoto + TM-score
+                                 (id, pK, Tanimoto, TM, RMSD) and whether it
+                                 passes the CleanSplit criterion (nn_is_close)
+    n_close_label_agree          close training complexes with |dpK| < 1, i.e.
+                                 the pairs the GEMS filter removes
+                                 (remove_train_test_sims.py conditions every
+                                 removal on |dpK| < 1). Should be 0 for CASF if
+                                 labels and matrices match the ones GEMS used.
+                                 _v2020: the same with the PDBbind v2020 labels
+                                 GEMS used (column pk_v2020), to separate label
+                                 differences (R1 vs v2020) from matrix versions.
+    close_min_dpk                smallest |dpK| among the close training
+                                 complexes (NaN if there are none)
 
 If val_predictions.csv / test_predictions.csv exist in the run folder, the
 model's errors are joined and summarised by similarity.
@@ -72,7 +85,8 @@ def spearman(a, b):
     return pearson(pd.Series(a).rank().values, pd.Series(b).rank().values)
 
 
-def analyse_set(name, query_ids, train_pos, train_ids_arr, train_pk, idx, T, M, R, exclude_self):
+def analyse_set(name, query_ids, train_pos, train_ids_arr, train_pk, train_pk_v2020,
+                query_pk, query_pk_v2020, idx, T, M, R, exclude_self):
     rows = []
     for pid in query_ids:
         i = idx[pid]
@@ -86,6 +100,8 @@ def analyse_set(name, query_ids, train_pos, train_ids_arr, train_pk, idx, T, M, 
             for arr in (tan, tm, search, s_score):
                 arr[own] = -np.inf
         close = (tan > TANIMOTO_T) | ((tm > TM_T) & (s_score > S_T))
+        dpk_close = np.abs(train_pk[close] - query_pk[pid])
+        dpk_close_v2020 = np.abs(train_pk_v2020[close] - query_pk_v2020[pid])
         top = np.argsort(-search)[:TOP_N]
         w = search[top]
         knn = float(np.average(train_pk[top], weights=w)) if np.all(np.isfinite(w)) and w.sum() > 0 \
@@ -102,6 +118,11 @@ def analyse_set(name, query_ids, train_pos, train_ids_arr, train_pk, idx, T, M, 
             "nn_pk": float(train_pk[nn]),
             "nn_tanimoto": float(tan[nn]),
             "nn_tm": float(tm[nn]),
+            "nn_rmsd": float(rmsd[nn]),
+            "nn_is_close": bool(close[nn]),
+            "n_close_label_agree": int((dpk_close < 1.0).sum()),
+            "n_close_label_agree_v2020": int((dpk_close_v2020 < 1.0).sum()),
+            "close_min_dpk": float(dpk_close.min()) if len(dpk_close) else np.nan,
             "knn5_pred": knn,
         })
     return rows
@@ -144,6 +165,9 @@ def main():
     train_ids_arr = np.array(train_ids)
     train_pos = np.array([idx[i] for i in train_ids])
     train_pk = table.loc[train_ids, "pk"].to_numpy(dtype=float)
+    train_pk_v2020 = table.loc[train_ids, "pk_v2020"].to_numpy(dtype=float)
+    query_pk = table["pk"].to_dict()
+    query_pk_v2020 = table["pk_v2020"].to_dict()
 
     sets = {"val": split["val_ids"], **split["test_ids"]}
     if args.train_sample > 0:
@@ -157,7 +181,8 @@ def main():
         if len(ids_in) < len(ids):
             print(f"Warning: {len(ids) - len(ids_in)} {name} IDs are not in the matrices")
         print(f"{name}: {len(ids_in)} complexes ...", flush=True)
-        rows += analyse_set(name, ids_in, train_pos, train_ids_arr, train_pk, idx, T, M, R,
+        rows += analyse_set(name, ids_in, train_pos, train_ids_arr, train_pk, train_pk_v2020,
+                            query_pk, query_pk_v2020, idx, T, M, R,
                             exclude_self=name.startswith("train"))
     df = pd.DataFrame(rows)
     df["y_true"] = table.loc[df["pdb_id"], "pk"].to_numpy(dtype=float)
@@ -192,6 +217,10 @@ def main():
             "median_max_tm": g["max_tm"].median(),
             "median_max_search": g["max_search"].median(),
             "frac_with_close_train": (g["n_close"] > 0).mean(),
+            "frac_nn_is_close": g["nn_is_close"].mean(),
+            "frac_close_label_agree": (g["n_close_label_agree"] > 0).mean(),
+            "frac_close_label_agree_v2020": (g["n_close_label_agree_v2020"] > 0).mean(),
+            "n_close_label_agree_total": int(g["n_close_label_agree"].sum()),
             "knn5_rmse": rmse(g["knn5_pred"], g["y_true"]),
             "knn5_r": pearson(g["knn5_pred"], g["y_true"]),
             "model_rmse": rmse(g.loc[has, "y_pred"], g.loc[has, "y_true"]) if has.any() else np.nan,
@@ -223,6 +252,10 @@ def main():
     print("\n=== Similarity to the training set (closest training complex) ===")
     print(summ[["set", "n", "median_max_tanimoto", "median_max_tm", "median_max_search",
                 "frac_with_close_train"]].round(3).to_string(index=False))
+    print("\n=== Close training complexes (CleanSplit criterion) and their labels ===")
+    print("frac_close_label_agree should be 0 for the CASF sets if labels and matrices match GEMS")
+    print(summ[["set", "n", "frac_with_close_train", "frac_nn_is_close", "frac_close_label_agree",
+                "frac_close_label_agree_v2020", "n_close_label_agree_total"]].round(3).to_string(index=False))
     print("\n=== Search baseline (top-5 by Tanimoto + TM, our train) vs model ===")
     print(summ[["set", "knn5_rmse", "knn5_r", "model_rmse", "model_r", "r_model_vs_knn5",
                 "spearman_abs_err_vs_max_search"]].round(3).to_string(index=False))
