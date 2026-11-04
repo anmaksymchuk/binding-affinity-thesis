@@ -8,12 +8,15 @@ the global Pearson R / RMSE do not show: a model can get the target-level
 average right and still rank the ligands of a target poorly, or the reverse.
 
 Clusters. If the official CASF-2016 CoreSet.dat is given (--coreset, column
-"target"), it is used for casf2016. Otherwise clusters are rebuilt from the
-GEMS protein TM-score matrix: connected components of TM > t among the
+"target"), it is used for casf2016. Otherwise clusters are rebuilt from a GEMS
+protein similarity matrix: sequence identity (pairwise_similarity_matrix_seqid,
+which matches how CASF defines its targets) if it is there, else TM-score
+(--cluster_by to force one). Connected components of similarity > t among the
 complexes of the set, with t chosen on a grid so that as many components as
 possible have the official size (5 or 3); average-linkage clustering into the
 official number of targets is tried too and the better split is kept. The
-script prints the size distribution so you can see how clean it is. Cluster
+script prints the size distribution so you can see how clean it is. (TM-score
+alone fragments CASF-2016 into ~140 groups, so sequence identity is preferred.) Cluster
 labels are always computed on the FULL set (all 285 / 195 IDs, from
 complexes.csv), so complexes without a prediction (e.g. failed graphs) leave
 incomplete groups instead of shifting the clustering; they are listed.
@@ -74,24 +77,26 @@ def n_exact(labels, k):
     return int((sizes == k).sum())
 
 
-def cluster_by_tm(ids, idx, M, k):
+def cluster_by_matrix(ids, idx, M, k, name):
     pos = np.array([idx[i] for i in ids])
-    sub = np.asarray(M[np.ix_(pos, pos)], dtype=np.float64)
+    sub = np.nan_to_num(np.asarray(M[np.ix_(pos, pos)], dtype=np.float64), nan=0.0)
+    if np.nanmax(sub) > 1.5:          # percent -> fraction
+        sub = sub / 100.0
     tm = (sub + sub.T) / 2
     np.fill_diagonal(tm, 1.0)
     best = None
-    for t in np.round(np.arange(0.50, 0.995, 0.01), 2):
+    for t in np.round(np.arange(0.20, 0.995, 0.01), 2):
         _, lab = connected_components(csr_matrix(tm > t), directed=False)
         score = n_exact(lab, k)
         if best is None or score > best[0]:
-            best = (score, lab, f"connected components, TM > {t:.2f}")
+            best = (score, lab, f"{name}, connected components at > {t:.2f}")
     dist = np.clip(1.0 - tm, 0, None)
     np.fill_diagonal(dist, 0.0)
     lab = fcluster(linkage(squareform(dist, checks=False), "average"),
                    t=len(ids) // k, criterion="maxclust")
     score = n_exact(lab, k)
     if score > best[0]:
-        best = (score, lab, f"average linkage into {len(ids) // k} clusters")
+        best = (score, lab, f"{name}, average linkage into {len(ids) // k} clusters")
     return pd.Series(best[1], index=ids), best[2]
 
 
@@ -143,6 +148,8 @@ def main():
     ap.add_argument("--sim_dir", default=None, help="folder with the GEMS similarity matrices")
     ap.add_argument("--run_dir", default=None)
     ap.add_argument("--coreset", default=None, help="optional CASF-2016 CoreSet.dat with official targets")
+    ap.add_argument("--cluster_by", choices=["auto", "seqid", "tm"], default="auto",
+                    help="matrix for rebuilding CASF targets (auto: seqid if present, else tm)")
     ap.add_argument("--n_boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -182,12 +189,19 @@ def main():
         else:
             if M is None:
                 if args.sim_dir is None:
-                    sys.exit("--sim_dir is needed to rebuild the CASF targets from the TM-score matrix")
+                    sys.exit("--sim_dir is needed to rebuild the CASF targets from a similarity matrix")
                 with open(find_file(args.sim_dir, "pairwise_similarity_complexes.json")) as f:
                     idx = {pid: n for n, pid in enumerate(json.load(f))}
-                M = np.load(find_file(args.sim_dir, "pairwise_similarity_matrix_tm.npy"), mmap_mode="r")
+                mname = args.cluster_by
+                if mname == "auto":
+                    try:
+                        find_file(args.sim_dir, "pairwise_similarity_matrix_seqid.npy")
+                        mname = "seqid"
+                    except FileNotFoundError:
+                        mname = "tm"
+                M = np.load(find_file(args.sim_dir, f"pairwise_similarity_matrix_{mname}.npy"), mmap_mode="r")
             ids = [i for i in full[s] if i in idx]
-            lab, how = cluster_by_tm(ids, idx, M, k)
+            lab, how = cluster_by_matrix(ids, idx, M, k, mname)
         clusters[s] = lab
         sizes = lab.value_counts().value_counts().sort_index()
         print(f"{s}: {len(lab)} complexes -> {lab.nunique()} targets ({how}); "
