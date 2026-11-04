@@ -48,6 +48,8 @@ python main.py
 | `split_info.json` | Настройки сплита, sha256 файлов сплита и `complexes.csv`, списки train/val/test ID, исключённые ID с причиной (`no_structure`, `no_label`, `censored_label`, `approx_label`, `graph_failed:<причина>`) |
 | `test_metrics.pt` | Метрики по каждому тестовому набору |
 | `test_predictions.csv` | Предсказания по комплексам: `test_set, pdb_id, y_true, y_pred` |
+| `val_predictions.csv` | То же для валидации (лучшая модель) |
+| `similarity/` | Результаты `tools/similarity_analysis.py` |
 | `best_model_rmse.pt`, `model_final_pKd.pt`, `y_stats.pt`, `training_history.pt` | Как раньше |
 | `last_checkpoint.pt` | Полное состояние обучения после последней эпохи (модель, оптимизатор, scheduler, история). Нужен для продолжения после обрыва |
 
@@ -56,3 +58,13 @@ python main.py
 Просто запустите `python main.py` ещё раз с теми же настройками: он найдёт `last_checkpoint.pt` и продолжит со следующей эпохи (`resume = True` в `config.py`). Если сплит или настройки обучения поменялись, он откажется продолжать. Если в папке результатов уже лежит `best_model_rmse.pt` без `last_checkpoint.pt` (запуск старой версии кода), `main.py` не станет его перезаписывать: переименуйте папку. Протестировать сохранённую модель без обучения можно через `python tools/evaluate.py`.
 
 Графы сохраняются частями по 1000 комплексов: `processed/graphs_<tag>_shardNNN.pt` и `.json` (в `.json` лежат ID части и причины, по которым графы не построились). Если построение прервалось, готовые части при следующем запуске используются повторно.
+
+## Анализ по сходству с train
+
+`tools/similarity_analysis.py` использует матрицы попарного сходства GEMS (Zenodo, https://doi.org/10.5281/zenodo.17190227: `pairwise_similarity_matrices.tar.gz` и `pairwise_similarity_complexes.json`): Tanimoto лигандов, TM-score белков и RMSD лиганда после выравнивания карманов. Для val, каждого набора CASF и случайной выборки train (без самого себя) он считает сходство с ближайшим комплексом train, число комплексов train, проходящих критерий фильтра CleanSplit, и прогноз поискового baseline GEMS (взвешенное среднее pK пяти самых похожих комплексов нашего train). Если в папке запуска есть `val_predictions.csv` и `test_predictions.csv`, к этому добавляются ошибки модели в зависимости от сходства.
+
+```bash
+python tools/similarity_analysis.py --sim_dir <папка с матрицами> --run_dir outputs/gnn_only_val15_seed42
+```
+
+Матрицы читаются через memory map, поэтому в память загружаются только нужные строки.

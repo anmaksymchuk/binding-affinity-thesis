@@ -486,6 +486,12 @@ def main():
     torch.save(test_metrics, config.test_metrics_path)
     pd.concat(prediction_frames).to_csv(config.test_predictions_path, index=False)
 
+    # Validation predictions of the best model (for error vs. similarity analysis)
+    _, val_preds = trainer.eval_step(val_loader, return_predictions=True)
+    val_df = pd.DataFrame(val_preds)
+    val_df.insert(0, "test_set", "val")
+    val_df.to_csv(config.val_predictions_path, index=False)
+
     print("\nSaved files:")
     print(f"  - {config.best_model_path}")
     print(f"  - {config.final_model_path}")
@@ -493,6 +499,7 @@ def main():
     print(f"  - {config.history_path}")
     print(f"  - {config.test_metrics_path}")
     print(f"  - {config.test_predictions_path}")
+    print(f"  - {config.val_predictions_path}")
     print(f"  - {split_info_path}")
     print("\nAll saved. Done!")
 

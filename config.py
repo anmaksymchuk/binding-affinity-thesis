@@ -167,6 +167,7 @@ class Config:
     history_path = os.path.join(output_dir, "training_history.pt")
     test_metrics_path = os.path.join(output_dir, "test_metrics.pt")
     test_predictions_path = os.path.join(output_dir, "test_predictions.csv")
+    val_predictions_path = os.path.join(output_dir, "val_predictions.csv")
     split_info_path = os.path.join(output_dir, "split_info.json")
 
     # Full training state (model, optimizer, scheduler, epoch, history),
