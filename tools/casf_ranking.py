@@ -7,8 +7,11 @@ power asks whether a model orders the ligands of one target correctly, which
 the global Pearson R / RMSE do not show: a model can get the target-level
 average right and still rank the ligands of a target poorly, or the reverse.
 
-Clusters. If the official CASF-2016 CoreSet.dat is given (--coreset, column
-"target"), it is used for casf2016. Otherwise clusters are rebuilt from a GEMS
+Clusters. If the official CoreSet.dat files are given (--coreset for
+CASF-2016, --coreset2013 for CASF-2013; the target column is found by a header
+named "target"/"cluster", else the last integer column), they are used.
+Without them the split is an approximate reconstruction, so do not compare the
+numbers with published CASF ranking benchmarks. Otherwise clusters are rebuilt from a GEMS
 protein similarity matrix: sequence identity (pairwise_similarity_matrix_seqid,
 which matches how CASF defines its targets) if it is there, else TM-score
 (--cluster_by to force one). Connected components of similarity > t among the
@@ -25,10 +28,15 @@ Reads <run_dir>/similarity/similarity_per_complex.csv (from
 tools/similarity_analysis.py), which has y_true, the model's y_pred and the
 search baseline knn5_pred, and reports for both predictors:
   1. Per-target Spearman and Kendall, averaged over targets (CASF ranking
-     power), with a bootstrap 95% CI over targets.
+     power), with a bootstrap 95% CI over targets; high-level success rate
+     (whole order right) and low-level success rate (best ligand predicted
+     best), as in CASF-2013; paired bootstrap of the Spearman difference
+     model - search on the same resampled targets.
   2. Pairwise differences within a target: error of predicted dpK,
      (yhat_i - yhat_j) - (y_i - y_j), sign accuracy and slope of predicted on
      true dpK, by |true dpK| bin. A target-wide offset cancels here.
+     2b: the same by ligand Tanimoto of the pair (needs --sim_dir); the row
+     Tanimoto >= 0.7 x |dpK| >= 2 holds activity-cliff-like pairs.
   3. MSE decomposition into a per-target offset (mean error of the target)
      and the error left within targets.
   4. Ranking vs the pK range of the target.
@@ -101,13 +109,24 @@ def cluster_by_matrix(ids, idx, M, k, name):
 
 
 def read_coreset(path):
-    rows = []
+    """PDB code -> target id from a CASF CoreSet.dat (whitespace separated)."""
+    col, rows = None, []
     with open(path) as f:
         for line in f:
-            if line.startswith("#") or not line.strip():
+            if not line.strip():
+                continue
+            if line.startswith("#"):
+                names = [x.lower() for x in line.lstrip("#").split()]
+                for key in ("target", "cluster"):
+                    if key in names:
+                        col = names.index(key)
                 continue
             parts = line.split()
-            rows.append((parts[0].lower(), int(parts[-1])))
+            if col is not None and col < len(parts):
+                val = parts[col]
+            else:
+                val = next(x for x in reversed(parts) if x.lstrip("-").isdigit())
+            rows.append((parts[0].lower(), val))
     return pd.Series(dict(rows))
 
 
@@ -127,20 +146,35 @@ def per_target(g, col):
         if len(sub) >= 3:
             r["spearman"] = stats.spearmanr(sub[col], sub["y_true"])[0]
             r["kendall"] = stats.kendalltau(sub[col], sub["y_true"])[0]
+            r["low_level_success"] = float(sub[col].idxmax() == sub["y_true"].idxmax())
+            r["high_level_success"] = float((sub.sort_values("y_true")[col].diff().dropna() > 0).all())
         else:
-            r["spearman"] = r["kendall"] = np.nan
+            r["spearman"] = r["kendall"] = r["low_level_success"] = r["high_level_success"] = np.nan
         rows.append(r)
     return pd.DataFrame(rows)
 
 
-def pairs(g, col):
+def pairs(g, col, T=None, idx=None):
     rows = []
     for c, sub in g.groupby("cluster"):
-        y, p = sub["y_true"].to_numpy(), sub[col].to_numpy()
+        y, p, ids = sub["y_true"].to_numpy(), sub[col].to_numpy(), sub["pdb_id"].to_numpy()
         for i in range(len(sub)):
             for j in range(i + 1, len(sub)):
-                rows.append({"cluster": c, "dy": y[i] - y[j], "dyhat": p[i] - p[j]})
+                tan = np.nan
+                if T is not None and ids[i] in idx and ids[j] in idx:
+                    tan = float(T[idx[ids[i]], idx[ids[j]]])
+                rows.append({"cluster": c, "id_i": ids[i], "id_j": ids[j], "tanimoto": tan,
+                             "dy": y[i] - y[j], "dyhat": p[i] - p[j]})
     return pd.DataFrame(rows)
+
+
+def pair_stats(sub, slope=True):
+    """Slope only over all pairs: inside a |dpK| bin the range of dpK is cut and the slope is biased."""
+    nz = sub[sub["dy"] != 0]
+    return {"n_pairs": len(sub),
+            "rmse_dpk": np.sqrt(np.mean((sub["dyhat"] - sub["dy"]) ** 2)) if len(sub) else np.nan,
+            "sign_accuracy": (np.sign(nz["dyhat"]) == np.sign(nz["dy"])).mean() if len(nz) else np.nan,
+            "slope_dyhat_on_dy": np.polyfit(sub["dy"], sub["dyhat"], 1)[0] if slope and len(sub) >= 5 else np.nan}
 
 
 def main():
@@ -148,6 +182,7 @@ def main():
     ap.add_argument("--sim_dir", default=None, help="folder with the GEMS similarity matrices")
     ap.add_argument("--run_dir", default=None)
     ap.add_argument("--coreset", default=None, help="optional CASF-2016 CoreSet.dat with official targets")
+    ap.add_argument("--coreset2013", default=None, help="optional CASF-2013 CoreSet.dat with official targets")
     ap.add_argument("--cluster_by", choices=["auto", "seqid", "tm"], default="auto",
                     help="matrix for rebuilding CASF targets (auto: seqid if present, else tm)")
     ap.add_argument("--n_boot", type=int, default=5000)
@@ -180,18 +215,24 @@ def main():
 
     # ---- Clusters ----
     clusters = {}
-    M = idx = None
+    M = idx = T = None
+    if args.sim_dir is not None:
+        with open(find_file(args.sim_dir, "pairwise_similarity_complexes.json")) as f:
+            idx = {pid: n for n, pid in enumerate(json.load(f))}
+        T = np.load(find_file(args.sim_dir, "pairwise_similarity_matrix_tanimoto.npy"), mmap_mode="r")
+    official = {"casf2016": args.coreset, "casf2013": args.coreset2013}
     for s, k in GROUP_SIZE.items():
-        if s == "casf2016" and args.coreset:
-            lab = read_coreset(args.coreset)
-            how = f"official targets from {os.path.basename(args.coreset)}"
-            lab = lab.reindex(full[s])
+        if official[s]:
+            lab = read_coreset(official[s])
+            how = f"official targets from {official[s]}"
+            not_found = [i for i in full[s] if i not in lab.index]
+            if not_found:
+                print(f"  Warning: {len(not_found)} {s} IDs not in {official[s]}: {not_found[:10]}")
+            lab = lab.reindex(full[s]).dropna()
         else:
             if M is None:
                 if args.sim_dir is None:
                     sys.exit("--sim_dir is needed to rebuild the CASF targets from a similarity matrix")
-                with open(find_file(args.sim_dir, "pairwise_similarity_complexes.json")) as f:
-                    idx = {pid: n for n, pid in enumerate(json.load(f))}
                 mname = args.cluster_by
                 if mname == "auto":
                     try:
@@ -222,35 +263,44 @@ def main():
     d = d[d["y_pred"].notna() & d["cluster"].notna()]
 
     # ---- 1. Ranking power ----
-    rank_rows, per_target_all, pair_rows, dec_rows = [], [], [], []
+    rank_rows, per_target_all, pair_rows, tan_rows, dec_rows = [], [], [], [], []
+    TAN_BINS, TAN_LABELS = [0.0, 0.4, 0.7, 1.01], ["<0.4", "0.4-0.7", ">=0.7"]
     for s in GROUP_SIZE:
         g = d[d["set"] == s]
+        sizes = g.groupby("cluster").size().value_counts().sort_index()
+        size_str = ", ".join(f"{int(n)}x{int(sz)}" for sz, n in sizes.items())
+        pts = {}
         for name, col in PREDICTORS.items():
             pt = per_target(g, col).assign(set=s, predictor=name)
             per_target_all.append(pt)
             ok = pt.dropna(subset=["spearman"]).set_index("cluster")
+            pts[name] = ok
             lo, hi = boot_ci(lambda cs: ok.loc[cs, "spearman"].mean(), ok.index, args.n_boot, rng)
             rank_rows.append({
-                "set": s, "predictor": name, "n_targets": len(ok),
+                "set": s, "predictor": name, "n_targets_used": len(ok), "groups_with_predictions": size_str,
                 "mean_spearman": ok["spearman"].mean(), "spearman_ci_low": lo, "spearman_ci_high": hi,
                 "mean_kendall": ok["kendall"].mean(),
+                "high_level_success": ok["high_level_success"].mean(),
+                "low_level_success": ok["low_level_success"].mean(),
                 "share_targets_spearman_gt_0.5": (ok["spearman"] > 0.5).mean(),
                 "global_pearson": np.corrcoef(g[col], g["y_true"])[0, 1],
             })
 
             # 2. Pairwise dpK
-            pr = pairs(g, col)
-            pr["eps"] = pr["dyhat"] - pr["dy"]
+            pr = pairs(g, col, T, idx)
             pr["bin"] = pd.cut(pr["dy"].abs(), DPK_BINS, labels=DPK_LABELS, right=False)
-            nz = pr[pr["dy"] != 0]
-            pair_rows.append({"set": s, "predictor": name, "dy_bin": "all", "n_pairs": len(pr),
-                              "rmse_dpk": np.sqrt(np.mean(pr["eps"] ** 2)),
-                              "sign_accuracy": (np.sign(nz["dyhat"]) == np.sign(nz["dy"])).mean(),
-                              "slope_dyhat_on_dy": np.polyfit(pr["dy"], pr["dyhat"], 1)[0]})
-            for b, sub in nz.groupby("bin", observed=True):
-                pair_rows.append({"set": s, "predictor": name, "dy_bin": b, "n_pairs": len(sub),
-                                  "rmse_dpk": np.sqrt(np.mean(sub["eps"] ** 2)),
-                                  "sign_accuracy": (np.sign(sub["dyhat"]) == np.sign(sub["dy"])).mean()})
+            pair_rows.append({"set": s, "predictor": name, "dy_bin": "all", **pair_stats(pr)})
+            for b, sub in pr[pr["dy"] != 0].groupby("bin", observed=True):
+                pair_rows.append({"set": s, "predictor": name, "dy_bin": b, **pair_stats(sub, slope=False)})
+
+            # 2b. By ligand similarity of the pair
+            if pr["tanimoto"].notna().any():
+                pr["tan_bin"] = pd.cut(pr["tanimoto"], TAN_BINS, labels=TAN_LABELS, right=False)
+                for tb, sub in pr.groupby("tan_bin", observed=True):
+                    tan_rows.append({"set": s, "predictor": name, "tanimoto": tb, "dy_bin": "all", **pair_stats(sub)})
+                    for b, sub2 in sub[sub["dy"] != 0].groupby("bin", observed=True):
+                        tan_rows.append({"set": s, "predictor": name, "tanimoto": tb, "dy_bin": b,
+                                         **pair_stats(sub2, slope=False)})
 
             # 3. MSE decomposition: per-target offset + within-target error
             e = g[col] - g["y_true"]
@@ -264,14 +314,28 @@ def main():
                 "std_pred_within_target": np.sqrt(np.mean((g[col] - g.groupby("cluster")[col].transform("mean")) ** 2)),
             })
 
+        # paired bootstrap of the Spearman difference on the same targets
+        common = pts["model"].index.intersection(pts["search"].index)
+        diff = pts["model"].loc[common, "spearman"] - pts["search"].loc[common, "spearman"]
+        lo, hi = boot_ci(lambda cs: diff.loc[cs].mean(), common, args.n_boot, rng)
+        rank_rows.append({"set": s, "predictor": "model - search", "n_targets_used": len(common),
+                          "groups_with_predictions": size_str,
+                          "mean_spearman": diff.mean(), "spearman_ci_low": lo, "spearman_ci_high": hi,
+                          "mean_kendall": (pts["model"].loc[common, "kendall"] - pts["search"].loc[common, "kendall"]).mean()})
+
     t_rank = pd.DataFrame(rank_rows)
     t_target = pd.concat(per_target_all, ignore_index=True)
     t_pairs = pd.DataFrame(pair_rows)
+    t_tan = pd.DataFrame(tan_rows)
     t_dec = pd.DataFrame(dec_rows)
     print("\n=== 1. Ranking power: Spearman / Kendall within targets, averaged over targets ===")
+    print("groups_with_predictions: number x size of the target groups that have predictions")
     print(t_rank.round(3).to_string(index=False))
     print("\n=== 2. Pairwise dpK within targets: (yhat_i - yhat_j) - (y_i - y_j) ===")
     print(t_pairs.round(3).to_string(index=False))
+    if len(t_tan):
+        print("\n=== 2b. Pairwise dpK by ligand Tanimoto of the pair (>=0.7 with |dpK| >= 2: cliff-like) ===")
+        print(t_tan.round(3).to_string(index=False))
     print("\n=== 3. MSE = per-target offset + within-target error ===")
     print(t_dec.round(3).to_string(index=False))
 
@@ -318,6 +382,7 @@ def main():
     print(t_boot.round(3).to_string(index=False))
 
     for name, t in [("1_ranking_power", t_rank), ("1_per_target", t_target), ("2_pairwise_dpk", t_pairs),
+                    ("2b_pairwise_by_tanimoto", t_tan),
                     ("3_offset_vs_within", t_dec), ("4_ranking_vs_range", t_range),
                     ("5_cluster_bootstrap", t_boot)]:
         t.to_csv(os.path.join(out, f"{name}.csv"), index=False)
