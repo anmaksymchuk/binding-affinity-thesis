@@ -6,25 +6,37 @@ Paired comparison of three models on exactly the same complexes.
     fp      Morgan fingerprints + boosting outputs/<full>_fold{k}_seed{s}/ligand_fp/predictions.csv
 
 The three are trained on the same folds of the same split, so the comparison is
-paired per complex. Everything is computed on the intersection of the pdb_ids
-that all three predict in every fold: the fingerprint baseline silently drops
-ligands RDKit cannot read, and comparing two sets that differ by a few
-complexes is not a comparison of the models.
+paired per complex. The headline result is the paired difference of mean
+squared error with a cluster confidence interval; the three RMSEs are the
+context that makes it readable. Within-target Spearman is the second,
+independent criterion: it asks whether the advantage survives when the
+comparison is made between ligands of one target.
 
-How the folds are combined (the rule we agreed on):
-    the squared error of a complex is averaged over the folds, never the
-    predictions. Averaging predictions would build an ensemble, which is a
-    different model; averaging e^2 estimates how a single model does.
-    Ranking is combined the same way: the Spearman of a target is computed
-    inside each fold first and then averaged over folds.
+What the script insists on:
+
+  * one prediction per (model, fold, complex), and every kept complex
+    predicted by all three models in every fold. The fingerprint baseline
+    silently drops ligands RDKit cannot read, and a set that differs by a few
+    complexes is not the same set. Duplicate rows stop the script.
+  * every kept complex carries a target from CoreSet.dat, so nothing falls out
+    of the cluster analysis unnoticed (--drop_untargeted to continue anyway).
+  * a target enters the ranking comparison only if its Spearman is defined for
+    every model in every fold, so all three are scored on the same targets.
+  * the squared error of a complex is averaged over the folds, never the
+    predictions: averaging predictions builds an ensemble, which is a
+    different model. Ranking is combined the same way, per target per fold
+    first and then over folds.
 
 Uncertainty: a paired bootstrap over CASF targets (the protein clusters of
 CoreSet.dat), not over complexes, because complexes of one target are not
-independent. The same resampled targets are used for every model, so the
-bootstrap measures the difference and not the two noisy numbers separately.
-The independent subsets have no targets of their own, so the targets of the
-parent set are used for them; within-target ranking is not reported there
-because their groups are incomplete.
+independent. The resampled targets are drawn once per test set and reused by
+every comparison, so the three differences are measured on the same draws and
+their joint distribution is saved. The folds are held fixed, not resampled:
+five is too few to resample, so the interval covers the sampling of targets
+only, and that is how it should be described.
+
+The independent subsets borrow the targets of their parent set and report no
+within-target ranking, their groups being incomplete.
 
 Usage (from the repo root):
     python tools/compare_models.py --coreset /path/CoreSet2016.dat \
@@ -33,12 +45,13 @@ Usage (from the repo root):
                                    [--ligand gnn_only_noH_amp_ligandonly] \
                                    [--folds 0 1 2 3 4] [--seed 42] [--n_boot 2000]
 
-Writes per_fold.csv, summary.csv and paired.csv into
-outputs/cv_summary_<full>/compare/.
+Writes per_fold.csv, summary.csv, paired.csv, common_ids.csv and
+bootstrap_draws.csv into outputs/cv_summary_<full>/compare/.
 """
 import os
 import sys
 import argparse
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,12 +63,25 @@ import pandas as pd
 from casf_ranking import read_coreset, per_target, pairs, pair_stats
 from trainer import Trainer
 
+# A model that predicts the same value for every ligand of a target has no
+# defined Spearman there. That is a result, not a problem: the target then
+# leaves the ranking comparison for every model and n_targets says so.
+warnings.filterwarnings("ignore", message="An input array is constant")
+warnings.filterwarnings("ignore", message="An input array is nearly constant")
+
 MODELS = ["full", "ligand", "fp"]
 LABELS = {"full": "GNN complex", "ligand": "GNN ligand only", "fp": "Morgan + boosting"}
+COMPARISONS = [("full", "ligand"), ("full", "fp"), ("ligand", "fp")]
+
 # Which CoreSet file gives the targets of each test set. The independent
 # subsets are subsets of their parent set, so they inherit its targets.
 PARENT = {"casf2016": "casf2016", "casf2016_indep": "casf2016",
           "casf2013": "casf2013", "casf2013_indep": "casf2013"}
+
+# Comparisons decided on before seeing the numbers. They are reported
+# uncorrected; everything else is a secondary family and gets Holm.
+PRIMARY = {("casf2016", "mse_diff", "full", "ligand"),
+           ("casf2016", "mse_diff", "full", "fp")}
 
 
 def metrics_of(y_true, y_pred):
@@ -107,19 +133,45 @@ def load(args):
     return d[d["set"].isin(PARENT)].copy()
 
 
-def common_ids(d, n_expected):
-    """IDs predicted by every model in every fold, per test set, and what was dropped."""
-    keep, dropped = [], []
+def common_ids(d, folds):
+    """
+    Keep the complexes predicted exactly once by every model in every fold.
 
-    for name, g in d.groupby("set"):
-        counts = g.groupby("pdb_id")["model"].count()
-        ids = set(counts[counts == n_expected].index)
-        missing = sorted(set(counts.index) - ids)
-        keep.append(g[g["pdb_id"].isin(ids)])
-        dropped.append({"set": name, "n_common": len(ids), "n_dropped": len(missing),
-                        "dropped_ids": " ".join(missing[:10])})
+    Counting rows is not enough: a duplicated row of one model could make up
+    for a complex another model is missing. The invariant the comparison needs
+    is the set of (model, fold) keys, so that is what is checked.
+    """
+    keys = ["set", "pdb_id", "model", "fold"]
+    dup = d[d.duplicated(keys, keep=False)]
+    if len(dup):
+        first = dup.sort_values(keys).head(6)[keys + ["y_pred"]]
+        raise SystemExit("Duplicate predictions for the same model, fold and complex; "
+                         "the comparison would not be paired.\n" + first.to_string(index=False))
 
-    return pd.concat(keep, ignore_index=True), pd.DataFrame(dropped)
+    # With duplicates ruled out, every (model, fold) key of a complex is
+    # distinct and comes from the expected universe, so counting the distinct
+    # keys is the same test as comparing the sets, and needs no groupby.apply.
+    expected = [(m, k) for m in MODELS for k in folds]
+    d = d.assign(_key=d["model"] + "/f" + d["fold"].astype(str))
+    have = d.groupby(["set", "pdb_id"])["_key"].nunique().rename("n_keys").reset_index()
+    have["ok"] = have["n_keys"] == len(expected)
+
+    present = set(zip(d["set"], d["pdb_id"], d["_key"]))
+    rows = []
+    for name, g in have.groupby("set"):
+        bad = g[~g["ok"]]
+        why = []
+        for pdb_id in bad["pdb_id"].head(5):
+            miss = [f"{m}/f{k}" for m, k in expected
+                    if (name, pdb_id, f"{m}/f{k}") not in present]
+            why.append(f"{pdb_id} (missing {','.join(miss)})")
+        rows.append({"set": name, "n_common": int(g["ok"].sum()), "n_dropped": len(bad),
+                     "dropped_ids": "; ".join(why)})
+
+    good = set(map(tuple, have.loc[have["ok"], ["set", "pdb_id"]].to_numpy()))
+    keep = d[[(s_, i) in good for s_, i in zip(d["set"], d["pdb_id"])]].drop(columns="_key")
+
+    return keep.copy(), pd.DataFrame(rows)
 
 
 def check_labels(d):
@@ -133,68 +185,102 @@ def check_labels(d):
                          f"(gap {worst:.3f} pK). The runs are not on the same data.")
 
 
-def per_complex_e2(d):
-    """Mean over folds of the squared error of each complex, per model."""
-    d = d.assign(e2=(d["y_pred"] - d["y_true"]) ** 2)
-    return (d.groupby(["set", "model", "pdb_id"])["e2"].mean()
-            .unstack("model").reset_index())
+def attach_targets(d, labels, drop_untargeted):
+    """Give every row its CASF target, and say so loudly if some complex has none."""
+    d = d.copy()
+    d["cluster"] = [labels[PARENT[s]].get(i, None) for s, i in zip(d["set"], d["pdb_id"])]
+    missing = d[d["cluster"].isna()]
+
+    if len(missing):
+        per_set = missing.groupby("set")["pdb_id"].nunique()
+        ids = sorted(missing["pdb_id"].unique())
+        msg = ("Complexes with no target in CoreSet.dat: "
+               + ", ".join(f"{s} {n}" for s, n in per_set.items())
+               + "\n  " + " ".join(ids[:20]) + (" ..." if len(ids) > 20 else ""))
+        if not drop_untargeted:
+            raise SystemExit(msg + "\nThey would silently leave the cluster analysis. "
+                                   "Check the CoreSet files, or pass --drop_untargeted.")
+        print("Warning: " + msg)
+        d = d.dropna(subset=["cluster"])
+
+    return d
 
 
-def per_target_spearman(d, labels):
-    """Mean over folds of the within-target Spearman, per model and target."""
+def spearman_table(d, folds):
+    """
+    Mean over folds of the within-target Spearman, per model and target.
+
+    A target is kept only where the Spearman is defined for every model in
+    every fold: a target scored for one model and not for another would make
+    the three columns incomparable and the count printed next to them wrong.
+    """
     rows = []
 
     for (name, model, fold), g in d.groupby(["set", "model", "fold"]):
-        g = g.copy()
-        g["cluster"] = g["pdb_id"].map(labels[PARENT[name]])
-        g = g.dropna(subset=["cluster"])
-        pt = per_target(g, "y_pred").dropna(subset=["spearman"])
+        pt = per_target(g, "y_pred")
         for _, r in pt.iterrows():
             rows.append({"set": name, "model": model, "fold": fold,
-                         "cluster": r["cluster"], "spearman": r["spearman"]})
+                         "cluster": r["cluster"], "n_in_group": r["n"],
+                         "spearman": r["spearman"]})
 
     if not rows:
-        return pd.DataFrame(columns=["set", "cluster"] + MODELS)
+        return pd.DataFrame(columns=["set", "cluster", "n_in_group"] + MODELS)
 
     s = pd.DataFrame(rows)
+    need = len(MODELS) * len(folds)
+    ok = (s.dropna(subset=["spearman"]).groupby(["set", "cluster"])["spearman"].size() == need)
+    ok = set(ok[ok].index)
 
-    return (s.groupby(["set", "model", "cluster"])["spearman"].mean()
-            .unstack("model").reset_index())
+    s = s[[(a, b) in ok for a, b in zip(s["set"], s["cluster"])]]
+    size = s.groupby(["set", "cluster"])["n_in_group"].first()
+    out = (s.groupby(["set", "model", "cluster"])["spearman"].mean()
+           .unstack("model").reset_index())
+
+    return out.merge(size.rename("n_in_group").reset_index(), on=["set", "cluster"])
 
 
-def boot_diff_weighted(values, groups, n_boot, rng):
+def weighted_draws(values, groups, idx, order):
     """
-    Paired bootstrap of a mean over complexes, resampling targets.
+    Bootstrap draws of a mean over complexes, resampling whole targets.
 
-    The complexes of a target move together, so the resampled mean is
-    sum(target sums) / sum(target counts) and never a mean of means.
+    The complexes of a target move together, so a draw is
+    sum(target sums) / sum(target counts), never a mean of means.
+    `idx` indexes `order`, the target list shared by every comparison.
     """
     df = pd.DataFrame({"v": values, "g": groups}).dropna()
-    agg = df.groupby("g")["v"].agg(["sum", "count"])
+    agg = df.groupby("g")["v"].agg(["sum", "count"]).reindex(order).fillna(0.0)
     sums, counts = agg["sum"].to_numpy(), agg["count"].to_numpy()
-    n = len(sums)
 
-    if n == 0:
-        return np.nan, np.nan, np.nan
-
-    idx = rng.integers(0, n, size=(n_boot, n))
-    draws = sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
-
-    return float(sums.sum() / counts.sum()), float(np.percentile(draws, 2.5)), \
-        float(np.percentile(draws, 97.5))
+    return sums.sum() / counts.sum(), sums[idx].sum(axis=1) / counts[idx].sum(axis=1)
 
 
-def boot_diff_targets(values, n_boot, rng):
-    """Paired bootstrap of a mean over targets (one value per target)."""
-    v = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
-    n = len(v)
+def target_draws(values, idx):
+    """Bootstrap draws of a mean over targets (one value per target)."""
+    v = np.asarray(values, dtype=float)
 
-    if n == 0:
-        return np.nan, np.nan, np.nan
+    return v.mean(), v[idx].mean(axis=1)
 
-    draws = v[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
 
-    return float(v.mean()), float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5))
+def summarize(point, draws):
+    """Point estimate, percentile interval and the two-sided bootstrap p-value."""
+    p = 2 * min(float(np.mean(draws <= 0)), float(np.mean(draws >= 0)))
+
+    return (float(point), float(np.percentile(draws, 2.5)), float(np.percentile(draws, 97.5)),
+            float(min(1.0, max(p, 1.0 / len(draws)))))
+
+
+def holm(p):
+    """Holm step-down adjustment; returns adjusted p-values in the input order."""
+    p = np.asarray(p, dtype=float)
+    m = len(p)
+    adj = np.empty(m)
+    run = 0.0
+
+    for rank, i in enumerate(np.argsort(p)):
+        run = max(run, (m - rank) * p[i])
+        adj[i] = min(run, 1.0)
+
+    return adj
 
 
 def main():
@@ -207,6 +293,8 @@ def main():
     ap.add_argument("--folds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     ap.add_argument("--n_boot", type=int, default=2000)
     ap.add_argument("--boot_seed", type=int, default=0)
+    ap.add_argument("--drop_untargeted", action="store_true",
+                    help="continue when a complex has no target in CoreSet.dat")
     ap.add_argument("--outputs", default="outputs")
     ap.add_argument("--out_dir", default=None)
     args = ap.parse_args()
@@ -218,21 +306,28 @@ def main():
                          "resamples CASF targets, which only those files define.")
 
     labels = {s: read_coreset(p) for s, p in official.items()}
+    group_size = {s: lab.value_counts() for s, lab in labels.items()}
     out_dir = args.out_dir or os.path.join(args.outputs, f"cv_summary_{args.full}", "compare")
     os.makedirs(out_dir, exist_ok=True)
 
     d = load(args)
     check_labels(d)
-    d, dropped = common_ids(d, n_expected=len(MODELS) * len(args.folds))
+    d, dropped = common_ids(d, args.folds)
+
     sets = [s for s in PARENT if s in set(d["set"]) and PARENT[s] in labels]
     skipped = sorted(set(d["set"]) - set(sets))
-    # Without the CoreSet file of its parent a set has no targets, so it cannot
-    # be bootstrapped; drop it here rather than half-way through the analysis.
     d = d[d["set"].isin(sets)].copy()
+    d = attach_targets(d, labels, args.drop_untargeted)
+
+    # Complexes without a target leave with --drop_untargeted, so the count
+    # printed below has to be the one the analysis actually uses.
+    actual = d.groupby("set")["pdb_id"].nunique()
+    dropped["n_common"] = (dropped["set"].map(actual)
+                           .fillna(dropped["n_common"]).astype(int))
 
     print(f"Folds:  {args.folds}, seed {args.seed}")
-    print(f"Models: " + ", ".join(f"{m} ({LABELS[m]})" for m in MODELS))
-    print("\nComplexes used (predicted by all three models in every fold):")
+    print("Models: " + ", ".join(f"{m} ({LABELS[m]})" for m in MODELS))
+    print("\nComplexes used (one prediction from every model in every fold):")
     for _, r in dropped[dropped["set"].isin(sets)].iterrows():
         note = f"  [{r['n_dropped']} dropped: {r['dropped_ids']}]" if r["n_dropped"] else ""
         print(f"  {r['set']:<16}{r['n_common']:>5}{note}")
@@ -246,10 +341,10 @@ def main():
         r = {"set": name, "model": model, "fold": fold,
              **metrics_of(g["y_true"].to_numpy(), g["y_pred"].to_numpy())}
 
-        if PARENT[name] == name:     # ranking only where the groups are complete
-            g = g.copy()
-            g["cluster"] = g["pdb_id"].map(labels[PARENT[name]])
-            g = g.dropna(subset=["cluster"])
+        # Ranking only where the set owns its targets. The independent subsets
+        # are scattered across the parent's targets, so their groups are
+        # fragments and a within-target order means nothing there.
+        if PARENT[name] == name:
             pt = per_target(g, "y_pred").dropna(subset=["spearman"])
             r["spearman"] = float(pt["spearman"].mean())
             r.update({k: float(v) for k, v in pair_stats(pairs(g, "y_pred")).items()
@@ -260,7 +355,7 @@ def main():
     per_fold = pd.DataFrame(rows)
     cols = [c for c in ["rmse", "mae", "ci", "pearson", "spearman",
                         "sign_accuracy", "slope_dyhat_on_dy"] if c in per_fold]
-    summary = (per_fold.groupby(["set", "model"])[cols].agg(["mean", "std"]))
+    summary = per_fold.groupby(["set", "model"])[cols].agg(["mean", "std"])
     summary.columns = [f"{m}_{s}" for m, s in summary.columns]
     summary = summary.reset_index()
 
@@ -280,55 +375,92 @@ def main():
                                 for c in ["spearman", "slope_dyhat_on_dy"])
             print(f"{LABELS[m]:<20}{line}")
 
+    print("\n± here is the spread of the five trained models, not a confidence interval "
+          "over targets.\nPearson, CI and the slope have no paired interval: only the "
+          "differences below are bootstrapped.")
+
     # ---------------- paired bootstrap over targets ----------------
     rng = np.random.default_rng(args.boot_seed)
-    e2 = per_complex_e2(d)
-    sp = per_target_spearman(d, labels)
-    pairs_ab = [("full", "ligand"), ("full", "fp"), ("ligand", "fp")]
-    boot_rows = []
+    e2 = (d.assign(e2=(d["y_pred"] - d["y_true"]) ** 2)
+          .groupby(["set", "cluster", "model", "pdb_id"])["e2"].mean()
+          .unstack("model").reset_index())
+    sp = spearman_table(d, args.folds)
+
+    boot_rows, draw_cols = [], {}
 
     for name in sets:
-        sub = e2[e2["set"] == name].copy()
-        sub["cluster"] = sub["pdb_id"].map(labels[PARENT[name]])
-        sub = sub.dropna(subset=["cluster"])
+        sub = e2[e2["set"] == name]
+        order = sorted(sub["cluster"].unique())
+        # One set of resampled targets per test set, reused by all three
+        # comparisons, so their draws are directly comparable and can be
+        # combined afterwards.
+        idx = rng.integers(0, len(order), size=(args.n_boot, len(order)))
 
-        for a, b in pairs_ab:
-            mean, lo, hi = boot_diff_weighted(sub[b] - sub[a], sub["cluster"], args.n_boot, rng)
+        for a, b in COMPARISONS:
+            point, draws = weighted_draws(sub[b] - sub[a], sub["cluster"], idx, order)
+            est, lo, hi, p = summarize(point, draws)
             boot_rows.append({"set": name, "metric": "mse_diff", "better": a, "worse": b,
-                              "n_targets": sub["cluster"].nunique(), "diff": mean,
-                              "lo": lo, "hi": hi})
+                              "n_targets": len(order), "n": len(sub),
+                              "diff": est, "lo": lo, "hi": hi, "p": p})
+            draw_cols[f"{name}|mse_diff|{a}-{b}"] = draws
 
         if PARENT[name] != name:
             continue
 
         s = sp[sp["set"] == name]
-        for a, b in pairs_ab:
-            mean, lo, hi = boot_diff_targets((s[a] - s[b]).to_numpy(), args.n_boot, rng)
-            boot_rows.append({"set": name, "metric": "spearman_diff", "better": a, "worse": b,
-                              "n_targets": len(s), "diff": mean, "lo": lo, "hi": hi})
+        if s.empty:
+            continue
+
+        complete = s[s["n_in_group"] == s["cluster"].map(group_size[PARENT[name]])]
+        for tag, t in (("spearman_diff", s), ("spearman_diff_complete", complete)):
+            if t.empty:
+                continue
+            tidx = rng.integers(0, len(t), size=(args.n_boot, len(t)))
+            for a, b in COMPARISONS:
+                point, draws = target_draws((t[a] - t[b]).to_numpy(), tidx)
+                est, lo, hi, p = summarize(point, draws)
+                boot_rows.append({"set": name, "metric": tag, "better": a, "worse": b,
+                                  "n_targets": len(t), "n": int(t["n_in_group"].sum()),
+                                  "diff": est, "lo": lo, "hi": hi, "p": p})
+                draw_cols[f"{name}|{tag}|{a}-{b}"] = draws
 
     boot = pd.DataFrame(boot_rows)
+    boot["primary"] = [(r["set"], r["metric"], r["better"], r["worse"]) in PRIMARY
+                       for _, r in boot.iterrows()]
+    boot["p_holm"] = np.nan
+    sec = ~boot["primary"]
+    if sec.any():
+        boot.loc[sec, "p_holm"] = holm(boot.loc[sec, "p"].to_numpy())
 
-    print(f"\nPaired bootstrap over targets ({args.n_boot} resamples, the same targets "
-          f"for every model).")
+    print(f"\nPaired bootstrap over targets ({args.n_boot} resamples; one set of resampled "
+          f"targets per\ntest set, shared by the three comparisons; the five folds are held "
+          f"fixed, so the\ninterval covers the sampling of targets only).")
     print("mse_diff: mean e^2 of the second model minus the first, so positive means the "
           "first is better.")
-    print("spearman_diff: within-target Spearman of the first minus the second, so positive "
-          "means the first ranks better.\n")
-    print(f"{'set':<16}{'metric':<16}{'comparison':<34}{'diff':>8}{'95% CI':>20}")
+    print("spearman_diff: within-target Spearman of the first minus the second. "
+          "'_complete' uses\nonly targets holding all their CoreSet ligands.\n")
+    print(f"{'set':<16}{'metric':<24}{'comparison':<34}{'n_t':>4}{'diff':>8}"
+          f"{'95% CI':>20}{'p':>9}{'p_Holm':>9}")
     for _, r in boot.iterrows():
         comp = f"{LABELS[r['better']]} vs {LABELS[r['worse']]}"
-        sig = "" if r["lo"] <= 0 <= r["hi"] else "  *"
-        print(f"{r['set']:<16}{r['metric']:<16}{comp:<34}{r['diff']:>8.3f}"
-              f"   [{r['lo']:>6.3f}, {r['hi']:>6.3f}]{sig}")
-    print("\n* marks an interval that does not contain zero.")
+        holm_s = "primary" if r["primary"] else f"{r['p_holm']:.3f}"
+        print(f"{r['set']:<16}{r['metric']:<24}{comp:<34}{r['n_targets']:>4}{r['diff']:>8.3f}"
+              f"   [{r['lo']:>6.3f}, {r['hi']:>6.3f}]{r['p']:>9.3f}{holm_s:>9}")
+
+    print("\nThe two primary comparisons (full vs ligand and full vs fp on casf2016, "
+          "mse_diff) were\nchosen before the numbers and are reported uncorrected. "
+          "Every other row is a secondary\nfamily member and carries a Holm-adjusted "
+          "p. Intervals are uncorrected 95% percentile\nbootstrap intervals, so read "
+          "them next to p_Holm rather than on their own.")
 
     per_fold.to_csv(os.path.join(out_dir, "per_fold.csv"), index=False)
     summary.round(4).to_csv(os.path.join(out_dir, "summary.csv"), index=False)
     boot.round(4).to_csv(os.path.join(out_dir, "paired.csv"), index=False)
     dropped.to_csv(os.path.join(out_dir, "common_ids.csv"), index=False)
+    pd.DataFrame(draw_cols).to_csv(os.path.join(out_dir, "bootstrap_draws.csv"), index=False)
 
-    print(f"\nSaved {out_dir}/per_fold.csv, summary.csv, paired.csv and common_ids.csv")
+    print(f"\nSaved {out_dir}/per_fold.csv, summary.csv, paired.csv, common_ids.csv "
+          f"and bootstrap_draws.csv")
 
 
 if __name__ == "__main__":
