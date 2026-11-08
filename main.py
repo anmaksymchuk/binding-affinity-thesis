@@ -19,7 +19,7 @@ from model import (
 from dataset import Ligand_Protein_Dataset
 from trainer import Trainer
 from config import Config
-from utils import compute_dataset_stats
+from utils import compute_dataset_stats, ligand_only_view
 from cleansplit import load_complexes_table, make_split, sha256_of, fold_file
 
 from rdkit import RDLogger
@@ -73,9 +73,18 @@ def main():
     # ---------------------------
     print(f"\n--- Loading Dataset from {config.data_dir} ---")
 
+    graph_input = getattr(config, "graph_input", "complex").lower()
+
+    if graph_input not in ("complex", "ligand"):
+        raise ValueError("graph_input must be 'complex' or 'ligand'")
+
+    if graph_input == "ligand":
+        print("Graph input: ligand only (pocket atoms, water and contact edges dropped)")
+
     table = load_complexes_table(config.complexes_csv)
 
     dataset = Ligand_Protein_Dataset(
+        transform=ligand_only_view if graph_input == "ligand" else None,
         root=config.root,
         data_dir=config.data_dir,
         complexes_csv=config.complexes_csv,
@@ -168,6 +177,7 @@ def main():
     split_info = {
         "seed": config.seed,
         "model_type": model_type,
+        "graph_input": graph_input,
         "protocol": "PDBbind v2020.R1 + CleanSplit",
         "label_source": config.label_source,
         "drop_censored_labels": config.drop_censored_labels,
@@ -420,6 +430,7 @@ def main():
                 "train_ids": train_ids,
                 "val_ids": val_ids,
                 "model_type": model_type,
+                "graph_input": graph_input,
                 "dataset_tag": config.dataset_tag,
                 "lr": config.learning_rate,
                 "batch_size": config.train_batch_size,
