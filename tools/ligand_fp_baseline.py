@@ -17,10 +17,14 @@ Options:
     --radius 2 --bits 2048     Morgan fingerprint settings
     --counts                   use bond counts instead of a binary fingerprint
     --model hgb|rf             gradient boosting (default) or random forest
+    --loss squared_error       matches the reported RMSE (default);
+                               absolute_error is robust to label outliers
 
 Writes into <run_dir>/ligand_fp/:
     metrics.csv          one row per set: n, RMSE, MAE, CI, Pearson
     predictions.csv      per-complex predictions for the paired analysis
+    missing_ids.csv      IDs whose ligand could not be read, so a paired
+                         comparison with the GNN is made on the intersection
 """
 import os
 import sys
@@ -112,6 +116,10 @@ def main():
     ap.add_argument("--bits", type=int, default=2048)
     ap.add_argument("--counts", action="store_true")
     ap.add_argument("--model", choices=["hgb", "rf"], default="hgb")
+    ap.add_argument("--loss", choices=["squared_error", "absolute_error"],
+                    default="squared_error",
+                    help="hgb: squared_error matches the reported RMSE, "
+                         "absolute_error is more robust to label outliers")
     ap.add_argument("--max_iter", type=int, default=1200, help="hgb: most trees to try")
     ap.add_argument("--step", type=int, default=50, help="hgb: trees added per val check")
     ap.add_argument("--patience", type=int, default=4, help="hgb: val checks without a gain")
@@ -137,20 +145,22 @@ def main():
     print(f"Fingerprint: Morgan r={args.radius}, {args.bits} bits, "
           f"{'counts' if args.counts else 'binary'}")
 
-    x, y, ids = {}, {}, {}
+    x, y, ids, missing = {}, {}, {}, []
     for name, set_ids in sets.items():
         xi, kept, failed = fingerprints(set_ids, table, c.data_dir, gen, args.counts, args.bits)
         x[name] = xi
         ids[name] = kept
         y[name] = np.array([pk[i] for i in kept], dtype=np.float64)
-        print(f"{name:<16}{len(kept)} complexes" + (f", {len(failed)} unreadable" if failed else ""))
+        missing += [{"set": name, "pdb_id": i} for i in failed]
+        print(f"{name:<16}{len(kept)} of {len(set_ids)} complexes"
+              + (f", {len(failed)} ligands unreadable" if failed else ""))
 
     if args.model == "hgb":
         from sklearn.ensemble import HistGradientBoostingRegressor
 
         def new_model(max_iter, warm_start=False):
             return HistGradientBoostingRegressor(
-                loss="absolute_error", max_iter=max_iter, learning_rate=0.06,
+                loss=args.loss, max_iter=max_iter, learning_rate=0.06,
                 max_leaf_nodes=63, min_samples_leaf=max(1, min(20, len(y["train"]) // 10)),
                 l2_regularization=1.0, early_stopping=False,
                 warm_start=warm_start, random_state=seed,
@@ -158,7 +168,7 @@ def main():
 
         # Number of trees chosen on the same validation set the GNN uses to
         # pick its best epoch, so neither model gets a free look at the tests.
-        print(f"Model:       HistGradientBoostingRegressor "
+        print(f"Model:       HistGradientBoostingRegressor, loss {args.loss} "
               f"(trees chosen on val, up to {args.max_iter})")
 
         probe = new_model(args.step, warm_start=True)
@@ -199,8 +209,15 @@ def main():
 
     m = pd.DataFrame(rows)
     m.insert(1, "model", args.model)
+    m.insert(2, "loss", args.loss if args.model == "hgb" else "squared_error")
+    m["n_in_split"] = [len(sets[r["set"]]) for r in rows]
     m.to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
     pd.DataFrame(preds).to_csv(os.path.join(out_dir, "predictions.csv"), index=False)
+
+    # A ligand this script cannot read is evaluated by the GNN but not here, so
+    # any paired comparison has to be made on the intersection of the IDs.
+    pd.DataFrame(missing, columns=["set", "pdb_id"]).to_csv(
+        os.path.join(out_dir, "missing_ids.csv"), index=False)
 
     print("\n" + "=" * 62)
     print("LIGAND-ONLY FINGERPRINT BASELINE (pK scale)")
@@ -209,7 +226,15 @@ def main():
         print(f"{r['set']:<16}{r['n']:>5}{r['rmse']:>9.4f}{r['mae']:>9.4f}"
               f"{r['ci']:>9.4f}{r['pearson']:>10.4f}")
     print("=" * 62)
-    print(f"\nSaved {out_dir}/metrics.csv and predictions.csv")
+
+    if missing:
+        n_test = sum(1 for r in missing if r["set"] not in ("train", "val"))
+        print(f"\n{len(missing)} ligands could not be read ({n_test} in a test set); "
+              f"their IDs are in missing_ids.csv.")
+        print("Compare with the GNN on the intersection of pdb_id, not on both "
+              "sets as they are.")
+
+    print(f"\nSaved {out_dir}/metrics.csv, predictions.csv and missing_ids.csv")
 
 
 if __name__ == "__main__":
