@@ -380,3 +380,58 @@ def get_pdb_ids_from_index(filename):
             pdb_ids.add(pdb_id)
 
     return pdb_ids
+
+# Index of the ligand indicator in the 44-dim atom feature vector
+# (see ligand_atom_to_feature / protein_atom_to_feature).
+LIGAND_INDICATOR_IDX = 43
+
+
+def ligand_only_view(data):
+    """
+    Keep only the ligand part of a complex graph.
+
+    Drops every pocket atom (protein and water) and every edge that touches
+    one, so the model sees the ligand atoms and ligand covalent bonds alone.
+    Both branches then carry the same ligand bonds, because the full graph
+    loses all intermolecular contact edges.
+
+    Used as a dataset transform for the ligand-only shortcut baseline, so the
+    graph cache built for the complexes can be reused without rebuilding it.
+    Atom features are left untouched: the protein and amino-acid blocks of the
+    feature vector are zero for ligand atoms anyway.
+    """
+    keep = data.x[:, LIGAND_INDICATOR_IDX] > 0.5
+
+    if bool(keep.all()):
+        return data
+
+    n_keep = int(keep.sum())
+
+    if n_keep == 0:
+        raise ValueError(f"No ligand atoms in graph {getattr(data, 'pdb_id', '?')}")
+
+    # Old node index -> new node index, -1 for dropped nodes.
+    remap = torch.full((data.x.size(0),), -1, dtype=torch.long)
+    remap[keep] = torch.arange(n_keep, dtype=torch.long)
+
+    data.x = data.x[keep]
+
+    for name in ("edge_index_1", "edge_index_2"):
+        edge_index = getattr(data, name, None)
+
+        if edge_index is None:
+            continue
+
+        mask = keep[edge_index[0]] & keep[edge_index[1]]
+        setattr(data, name, remap[edge_index[:, mask]])
+
+        # edge_weight and edge_type belong to the full graph (edge_index_2).
+        if name == "edge_index_2":
+            if getattr(data, "edge_weight", None) is not None:
+                data.edge_weight = data.edge_weight[mask]
+            if getattr(data, "edge_type", None) is not None:
+                data.edge_type = data.edge_type[mask]
+
+    data.num_nodes = n_keep
+
+    return data

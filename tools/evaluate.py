@@ -26,6 +26,7 @@ from config import Config
 from dataset import Ligand_Protein_Dataset
 from model import GNN_Only_Predictor
 from trainer import Trainer
+from utils import ligand_only_view
 
 
 def main():
@@ -38,9 +39,14 @@ def main():
     if split["model_type"] != "gnn_only":
         raise NotImplementedError(f"model_type {split['model_type']} is not supported yet")
 
+    # The run's own graph input, so a ligand-only run is re-evaluated
+    # on ligand-only graphs even if config.py has been changed since.
+    graph_input = split.get("graph_input", "complex")
+
     kwargs = dict(
         root=c.root, data_dir=c.data_dir, complexes_csv=c.complexes_csv,
         dataset_tag=split["dataset_tag"], esm_path=c.esm_path, esm_dim=c.esm_dim,
+        transform=ligand_only_view if graph_input == "ligand" else None,
     )
     for name in ("graph_shard_size", "pocket_hydrogens"):
         if hasattr(c, name):

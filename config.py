@@ -49,6 +49,15 @@ class Config:
         "" if pocket_hydrogens == "all" else f"_pocketH-{pocket_hydrogens}"
     )
 
+    # What the model is allowed to see:
+    #   "complex" - ligand + pocket atoms, covalent + contact edges (main protocol)
+    #   "ligand"  - ligand atoms and ligand bonds only. Pocket atoms, water and
+    #               every intermolecular edge are dropped when a graph is loaded,
+    #               so the graph cache built for the complexes is reused as is.
+    #               This is the ligand-only shortcut baseline: same architecture,
+    #               same training procedure, same train/val IDs, no protein.
+    graph_input = "complex"
+
     # Graphs are built and saved in shards of this many complexes
     # (saving all ~17k at once ran out of RAM on Colab).
     graph_shard_size = 1000
@@ -87,8 +96,13 @@ class Config:
 
     # One output folder per (model, validation split, seed), so runs do not overwrite each other
     val_tag = f"fold{fold}" if val_mode == "gems_fold" else f"val{int(val_split * 100)}"
+
+    # Marks a restricted input in the folder name, so a ligand-only run can
+    # never overwrite the complex run with the same experiment_name.
+    input_tag = "" if graph_input == "complex" else f"_{graph_input}only"
+
     output_dir = os.path.join(
-        project_dir, "outputs", f"{experiment_name}_{val_tag}_seed{seed}"
+        project_dir, "outputs", f"{experiment_name}{input_tag}_{val_tag}_seed{seed}"
     )
     os.makedirs(output_dir, exist_ok=True)
 
