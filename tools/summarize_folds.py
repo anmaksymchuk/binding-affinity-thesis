@@ -158,7 +158,8 @@ def main():
 
     print(f"Runs:        {args.prefix}_fold{{{','.join(str(k) for k in args.folds)}}}"
           f"_seed{args.seed}")
-    print(f"Graph input: {graph_inputs.pop()}")
+    graph_input = graph_inputs.pop()
+    print(f"Graph input: {graph_input}")
     print(f"Validation parts disjoint: {'yes' if overlap == 0 else f'NO ({overlap} shared IDs)'}")
 
     print("\nPer fold, RMSE:")
@@ -192,12 +193,20 @@ def main():
     main_set = "casf2016"
     if main_set in sets:
         r = summary.loc[main_set]
+        # The published models all see the complex. A run on another graph input
+        # belongs in this table only as a clearly marked ablation, or the row
+        # reads as our headline number against theirs.
+        ours = ("this work (GNN, no LM)" if graph_input == "complex"
+                else f"this work, {graph_input} only")
         print(f"\nCASF-2016 against published CleanSplit numbers "
               f"(mean of 5 single models, Graber et al. 2025 Fig. 3):")
         print(f"{'model':<30}{'RMSE':>9}{'Pearson':>10}")
-        print(f"{'this work (GNN, no LM)':<30}{r['rmse_mean']:>9.3f}{r['pearson_mean']:>10.3f}")
+        print(f"{ours:<30}{r['rmse_mean']:>9.3f}{r['pearson_mean']:>10.3f}")
         for name, rmse, pear in PUBLISHED:
             print(f"{name:<30}{rmse:>9.3f}{pear:>10.3f}")
+        if graph_input != "complex":
+            print(f"  The published rows are full-complex models, so our "
+                  f"{graph_input}-only row is not a like-for-like comparison.")
 
     print(f"\nSaved {out_dir}/per_fold.csv, summary.csv, ensemble.csv"
           + (", oof.csv" if not oof.empty else ""))
