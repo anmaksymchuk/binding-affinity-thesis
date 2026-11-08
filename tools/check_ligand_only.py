@@ -14,13 +14,21 @@ complex graph (dataset.get bypasses the transform) and asserts:
     dropped edges all touched pocket  no ligand-ligand edge was lost
     indices stay in range             max index < num_nodes, no NaN features
 
-Run it once before a ligand-only training run (needs the graph cache):
+Run it once before a ligand-only training run, with the config of that run:
+the graph cache it reads follows pocket_hydrogens, so set the pilot's values
+first and only then check.
+
     python tools/check_ligand_only.py [--n 500] [--batch_size 32] [--seed 42]
+
+With --compare_split <run_dir> it also recomputes the split from the current
+config and checks that train, val and every test set hold exactly the same
+complexes as that finished run, so the pilot is comparable per complex.
 
 Exits with a non-zero status if any check fails.
 """
 import os
 import sys
+import json
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,7 +40,18 @@ from torch_geometric.loader import DataLoader
 
 from config import Config
 from dataset import Ligand_Protein_Dataset
+from cleansplit import load_complexes_table, make_split
 from utils import ligand_only_view, LIGAND_INDICATOR_IDX
+
+
+def sort_pairs(edge_index):
+    """Edges as a sorted list of (u, v), so two edge lists compare directly."""
+    if edge_index.numel() == 0:
+        return edge_index.reshape(2, 0)
+
+    order = np.lexsort((edge_index[1].numpy(), edge_index[0].numpy()))
+
+    return edge_index[:, torch.from_numpy(order.copy())]
 
 
 def check_batch(batch):
@@ -66,11 +85,22 @@ def check_against_complex(lig, full):
     assert torch.equal(lig.x, full.x[keep]), f"{pdb_id}: atom features changed"
     assert torch.equal(lig.y, full.y), f"{pdb_id}: label changed"
 
+    # The edge lists must match pair for pair, not merely in count: the
+    # ligand-internal edges of the complex graph, renumbered the same way,
+    # have to be exactly the edges of the ligand view.
+    remap = torch.full((full.x.size(0),), -1, dtype=torch.long)
+    remap[keep] = torch.arange(n_lig, dtype=torch.long)
+
     for name in ("edge_index_1", "edge_index_2"):
         ei_full = getattr(full, name)
-        inside = int((keep[ei_full[0]] & keep[ei_full[1]]).sum())
-        n_kept = getattr(lig, name).shape[1]
-        assert n_kept == inside, f"{pdb_id}: {name} kept {n_kept}, ligand-internal {inside}"
+        inside = keep[ei_full[0]] & keep[ei_full[1]]
+        expected = remap[ei_full[:, inside]]
+        got = getattr(lig, name)
+
+        assert got.shape[1] == int(inside.sum()), (
+            f"{pdb_id}: {name} kept {got.shape[1]}, ligand-internal {int(inside.sum())}")
+        assert torch.equal(sort_pairs(got), sort_pairs(expected)), (
+            f"{pdb_id}: {name} holds different edges than the ligand bonds")
 
     # Every edge of the complex graph that was dropped must touch a pocket atom.
     ei_full = full.edge_index_2
@@ -83,14 +113,69 @@ def check_against_complex(lig, full):
             "nodes_complex": int(full.x.shape[0])}
 
 
+def compare_split(ds, c, ref_run_dir):
+    """
+    Check that the split the current config produces is the one a finished run
+    used, so the ligand-only pilot trains and tests on the same complexes as
+    the full model it will be compared with.
+    """
+    with open(os.path.join(ref_run_dir, "split_info.json")) as f:
+        ref = json.load(f)
+
+    table = load_complexes_table(c.complexes_csv)
+    ids = [d.pdb_id[0] if isinstance(d.pdb_id, list) else d.pdb_id
+           for d in (ds.get(i) for i in range(len(ds)))]
+    split = make_split(table, {str(i).lower() for i in ids}, c, skipped=ds.skipped)
+
+    print(f"\nSplit against {os.path.basename(os.path.normpath(ref_run_dir))}"
+          f" (its val_mode {ref['val_mode']}, fold {ref['fold']},"
+          f" graph_input {ref.get('graph_input', 'complex')}):")
+
+    same = True
+    pairs = [("train", split["train_ids"], ref["train_ids"]),
+             ("val", split["val_ids"], ref["val_ids"])]
+    pairs += [(name, split["test_ids"][name], ref["test_ids"][name])
+              for name in split["test_ids"] if name in ref["test_ids"]]
+
+    for name, mine, theirs in pairs:
+        equal = set(mine) == set(theirs)
+        same = same and equal
+        print(f"  {name:<16}{len(mine):>6} vs {len(theirs):<6} "
+              f"{'identical' if equal else 'DIFFERENT'}")
+
+    if not same:
+        raise SystemExit(
+            "\nThe split differs from the reference run. Check val_mode, fold, "
+            "seed, the label filters and the graph cache before training, "
+            "otherwise the two models are not comparable per complex.")
+
+    print("  Same train, val and test complexes as the reference run.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=500, help="complexes to check")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--compare_split", default=None, metavar="RUN_DIR",
+                    help="also check that the split of the current config matches "
+                         "this finished run's split_info.json")
     args = ap.parse_args()
 
     c = Config()
+
+    # The graph cache and the split follow config.py, so run this script with
+    # the settings of the run it is checking, not with the defaults.
+    print(f"pocket_hydrogens: {c.pocket_hydrogens}")
+    print(f"graph_input:      {getattr(c, 'graph_input', 'complex')}")
+    print(f"val_mode:         {c.val_mode}"
+          + (f", fold {c.fold}" if c.val_mode == "gems_fold" else ""))
+
+    if getattr(c, "graph_input", "complex") != "ligand":
+        print("\nNote: config.graph_input is not \"ligand\". This script checks the\n"
+              "ligand view anyway, but `python main.py` with this config would train\n"
+              "on the complexes. Set graph_input = \"ligand\" before the pilot, and\n"
+              "check the cache the pilot will use (pocket_hydrogens).")
 
     # The dataset carries the transform, exactly as main.py sets it up with
     # graph_input = "ligand", whatever config.py currently says.
@@ -107,6 +192,9 @@ def main():
     )
 
     n_total = len(ds)
+    if n_total == 0:
+        raise RuntimeError("Graph cache is empty for this dataset_tag.")
+
     n = min(args.n, n_total)
     idx = np.random.default_rng(args.seed).choice(n_total, size=n, replace=False)
     idx = sorted(int(i) for i in idx)
@@ -150,6 +238,9 @@ def main():
     if empty:
         print(f"Warning: {empty} of {n} ligands have no bonds in the cache "
               f"(single atoms or a parsing problem)")
+
+    if args.compare_split:
+        compare_split(ds, c, args.compare_split)
 
 
 if __name__ == "__main__":
