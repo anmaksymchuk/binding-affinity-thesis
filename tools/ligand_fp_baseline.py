@@ -82,10 +82,16 @@ def fingerprints(ids, table, data_dir, gen, counts, bits):
             failed.append(pdb_id)
             continue
 
-        if counts:
-            fp = gen.GetCountFingerprintAsNumPy(mol)
-        else:
-            fp = gen.GetFingerprintAsNumPy(mol)
+        # A molecule RDKit reads can still fail here (bad valences, missing
+        # ring info): that ID belongs in missing_ids.csv, not in a traceback.
+        try:
+            if counts:
+                fp = gen.GetCountFingerprintAsNumPy(mol)
+            else:
+                fp = gen.GetFingerprintAsNumPy(mol)
+        except Exception:
+            failed.append(pdb_id)
+            continue
 
         rows.append(fp.astype(np.float32))
         kept.append(pdb_id)
