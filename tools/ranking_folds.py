@@ -10,6 +10,7 @@ and the similarity analysis of one run.
 
 Reported per test set with official targets (CASF-2016, CASF-2013):
     Spearman and Kendall within target, averaged over targets
+    median and quartiles of the per-target Spearman (the box GEMS Fig. 3c shows)
     low-level success  (the strongest ligand of the target ranked first)
     high-level success (the whole target ordered correctly)
     pairwise dpK: RMSE, sign accuracy, and the slope of predicted on true dpK
@@ -37,6 +38,10 @@ import pandas as pd
 from casf_ranking import read_coreset, per_target, pairs, pair_stats
 
 TARGET_METRICS = ["spearman", "kendall", "low_level_success", "high_level_success"]
+# Quartiles of the per-target Spearman. GEMS Fig. 3c reports the distribution
+# over the 57 clusters as a boxplot, so a comparison with it needs the median
+# and the box, not the mean.
+BOX_METRICS = ["spearman_median", "spearman_q1", "spearman_q3"]
 PAIR_METRICS = ["rmse_dpk", "sign_accuracy", "slope_dyhat_on_dy"]
 
 
@@ -51,6 +56,9 @@ def ranking_of(g):
         "n": len(g),
         "n_targets": len(ok),
         **{m: float(ok[m].mean()) for m in TARGET_METRICS},
+        "spearman_median": float(ok["spearman"].median()),
+        "spearman_q1": float(ok["spearman"].quantile(0.25)),
+        "spearman_q3": float(ok["spearman"].quantile(0.75)),
         **{m: float(ps[m]) for m in PAIR_METRICS},
         "n_pairs": int(ps["n_pairs"]),
     }
@@ -114,7 +122,7 @@ def main():
         ens_rows.append({"set": s, **ranking_of(g)})
     ensemble = pd.DataFrame(ens_rows)
 
-    cols = TARGET_METRICS + PAIR_METRICS
+    cols = TARGET_METRICS + BOX_METRICS + PAIR_METRICS
     summary = per_fold.groupby("set")[cols].agg(["mean", "std"]).reindex(list(official))
     summary.columns = [f"{m}_{s}" for m, s in summary.columns]
     summary.insert(0, "n_targets", per_fold.groupby("set")["n_targets"].first().reindex(list(official)))
@@ -140,6 +148,9 @@ def main():
     for r in ens_rows:
         print(f"  {r['set']:<12}" + "  ".join(f"{m} {r[m]:.3f}" for m in
                                               ["spearman", "kendall", "rmse_dpk", "slope_dyhat_on_dy"]))
+        print(f"  {'':<12}per-target Spearman median {r['spearman_median']:.3f} "
+              f"[{r['spearman_q1']:.3f}, {r['spearman_q3']:.3f}]  "
+              f"(GEMS Fig. 3c reports this box for its own ensemble)")
 
     if int(per_fold["no_target"].max()):
         n = int(per_fold.groupby("set")["no_target"].first().sum())
